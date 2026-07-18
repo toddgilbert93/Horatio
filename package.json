@@ -1,0 +1,26 @@
+{
+  "name": "flightrec",
+  "version": "0.1.0",
+  "description": "Flight recorder for MCP-driven Blender work: capture all BlenderMCP traffic, distill it with NVIDIA Nemotron into persistent project memory, serve it back via MCP.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "flightrec": "dist/distill/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "openai": "^4.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  }
+}
