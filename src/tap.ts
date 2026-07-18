@@ -297,10 +297,14 @@ if (process.env.FLIGHTREC_NO_AUTODISTILL !== '1') {
   try {
     const cliPath = fileURLToPath(new URL('./distill/cli.js', import.meta.url));
     if (fs.existsSync(cliPath)) {
+      // Detached and fire-and-forget, but not mute: diagnostics land in the
+      // session dir so distillation is debuggable after the fact.
+      const logFd = fs.openSync(path.join(session.dir, 'distill.log'), 'a');
       spawn(process.execPath, [cliPath, 'distill', '--follow', session.dir], {
         detached: true,
-        stdio: 'ignore',
+        stdio: ['ignore', logFd, logFd],
       }).unref();
+      fs.closeSync(logFd);
     }
   } catch (err) {
     console.error(`[flightrec tap] distiller auto-spawn failed (ignored): ${String(err)}`);

@@ -91,6 +91,17 @@ async function doChat(opts: ChatOpts): Promise<string> {
         // @ts-expect-error NVIDIA NIM extension, passed through by the SDK
         chat_template_kwargs: { enable_thinking: false },
       });
+      if (res.choices[0]?.finish_reason === 'length') {
+        // Truncated output is unusable (invalid JSON) — surface it as a
+        // distinct, non-retryable-here error so callers can raise the cap.
+        const err = new Error(`output truncated at max_tokens=${opts.maxTokens ?? 4096}`) as Error & {
+          status: number;
+          truncated: boolean;
+        };
+        err.status = 422;
+        err.truncated = true;
+        throw err;
+      }
       const content = res.choices[0]?.message?.content ?? '';
       return stripWrappers(content);
     } catch (err) {
