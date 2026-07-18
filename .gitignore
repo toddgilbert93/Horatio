@@ -4,7 +4,21 @@ dist/
 *.log
 .DS_Store
 
-# session data never belongs in the repo (lives in ~/.flightrec, but guard anyway)
+# project-local flightrec store (sessions, screenshots, memory — never commit)
+.flightrec/
+
+# local smoke-test store (never commit)
+.test-flightrec/
+.test-flightrec-app/
+
+# session data never belongs in the repo (legacy / accidental paths)
 sessions/
 raw.jsonl
 digest.jsonl
+
+# desktop Electron build output
+desktop/node_modules/
+desktop/out/
+desktop/dist/
+desktop/release/
+desktop/resources/flightrec-runtime/

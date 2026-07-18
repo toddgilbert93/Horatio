@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 /**
- * flightrec tap — transparent stdio wrapper around an MCP server.
+ * Horatio tap — transparent stdio wrapper around an MCP server.
  *
  *   node dist/tap.js -- uvx blender-mcp
  *
  * Forwarding is byte-for-byte via stream piping and never waits on logging.
  * Logging is a separate read of the same streams: newline-split, JSON-parsed
  * per line; a parse failure logs a raw record and changes nothing else.
+ *
+ * v2: session dirs are flat and NEVER move, so paths are stable for the whole
+ * process. The tap owns session.json (lifecycle) and its live/ pointer; it
+ * does no blend detection and no store scans — nothing runs on the forwarding
+ * path but forwarding.
  *
  * node:* builtins only. Boring is the spec.
  */
@@ -15,7 +20,16 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ImageRef, RawRecord, SessionMeta } from './lib/schema.js';
-import { artifactsDir, newSessionDir, rawPath } from './lib/store.js';
+import {
+  artifactsDir,
+  ensureRecordingHome,
+  newSessionDir,
+  rawPath,
+  readSessionInfo,
+  removeLivePointer,
+  writeLivePointer,
+  writeSessionInfo,
+} from './lib/store.js';
 
 // --------------------------------------------------------------------------
 // argv: everything after `--` is the child command
@@ -28,12 +42,26 @@ if (childCmd.length === 0) {
 }
 
 // --------------------------------------------------------------------------
-// session + log stream
+// session + log stream (recording never blocks on store state — v1 stores
+// get v2-shaped sessions appended; migration unifies later)
 // --------------------------------------------------------------------------
+ensureRecordingHome();
 const session = newSessionDir();
 const logFile = rawPath(session.dir);
 const logStream = fs.createWriteStream(logFile, { flags: 'a' });
 logStream.on('error', () => { /* logging must never take down forwarding */ });
+
+try {
+  writeSessionInfo(session.dir, {
+    id: session.id,
+    startedAt: new Date().toISOString(),
+    tapPid: process.pid,
+    cmd: childCmd,
+  });
+  writeLivePointer(session, process.pid);
+} catch {
+  /* metadata is best-effort; raw recording carries the ground truth */
+}
 
 let closed = false;
 let seq = 0;
@@ -48,7 +76,7 @@ function writeRecord(rec: Omit<RawRecord, 'ts' | 'seq'>): void {
   }
 }
 
-/** Teardown-time record: sync append so it survives process.exit. */
+/** Teardown: sync writes so they survive process.exit. */
 function writeFinalRecord(meta: SessionMeta): void {
   if (closed) return;
   closed = true;
@@ -56,6 +84,17 @@ function writeFinalRecord(meta: SessionMeta): void {
     const full: RawRecord = { ts: new Date().toISOString(), seq: seq++, dir: 'meta', bytes: 0, meta };
     fs.appendFileSync(logFile, JSON.stringify(full) + '\n');
   } catch { /* ignore */ }
+  try {
+    const info = readSessionInfo(session.dir);
+    if (info) {
+      writeSessionInfo(session.dir, {
+        ...info,
+        endedAt: new Date().toISOString(),
+        endReason: 'session_end',
+      });
+    }
+  } catch { /* ignore */ }
+  try { removeLivePointer(session.id); } catch { /* ignore */ }
   try { logStream.end(); } catch { /* ignore */ }
 }
 
@@ -67,7 +106,7 @@ const child: ChildProcess = spawn(childCmd[0], childCmd.slice(1), {
 });
 
 child.on('error', (err) => {
-  console.error(`[flightrec tap] failed to spawn child: ${String(err)}`);
+  console.error(`[horatio tap] failed to spawn child: ${String(err)}`);
   writeFinalRecord({ event: 'session_end', exitCode: null });
   process.exit(1);
 });
@@ -291,22 +330,23 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 // --------------------------------------------------------------------------
-// auto-spawn the distiller (fire-and-forget; failure never touches forwarding)
+// auto-spawn the live-activity follower (fire-and-forget; failure never
+// touches forwarding)
 // --------------------------------------------------------------------------
-if (process.env.FLIGHTREC_NO_AUTODISTILL !== '1') {
+const noActivity =
+  process.env.HORATIO_NO_ACTIVITY === '1' || process.env.FLIGHTREC_NO_AUTODISTILL === '1';
+if (!noActivity) {
   try {
     const cliPath = fileURLToPath(new URL('./distill/cli.js', import.meta.url));
     if (fs.existsSync(cliPath)) {
-      // Detached and fire-and-forget, but not mute: diagnostics land in the
-      // session dir so distillation is debuggable after the fact.
       const logFd = fs.openSync(path.join(session.dir, 'distill.log'), 'a');
-      spawn(process.execPath, [cliPath, 'distill', '--follow', session.dir], {
+      spawn(process.execPath, [cliPath, 'watch', session.id], {
         detached: true,
         stdio: ['ignore', logFd, logFd],
       }).unref();
       fs.closeSync(logFd);
     }
   } catch (err) {
-    console.error(`[flightrec tap] distiller auto-spawn failed (ignored): ${String(err)}`);
+    console.error(`[horatio tap] follower auto-spawn failed (ignored): ${String(err)}`);
   }
 }

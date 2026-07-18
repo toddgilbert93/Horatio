@@ -1,6 +1,6 @@
 # flightrec
 
-A flight recorder for MCP-driven Blender work. flightrec sits transparently between your MCP client (Claude Desktop / Claude Code) and [blender-mcp](https://github.com/ahujasid/blender-mcp), records every message, distills the traffic with **NVIDIA Nemotron** into persistent project memory, and serves that memory back to agents over MCP — so every future session warm-starts instead of cold-starts.
+A flight recorder for MCP-driven Blender work. flightrec sits transparently between your MCP client (Claude Desktop / Claude Code / Cursor) and [blender-mcp](https://github.com/ahujasid/blender-mcp), records every message, distills the traffic with **NVIDIA Nemotron** into persistent project memory, and serves that memory back to agents over MCP — so every future session warm-starts instead of cold-starts.
 
 ```
 Claude ──stdio──> tap ──stdio──> uvx blender-mcp ──tcp──> Blender
@@ -13,6 +13,8 @@ Claude ──stdio──> memory-server ──reads──> project-state.md + no
 
 **Core invariant:** `raw.jsonl` is the source of truth. Everything downstream is re-derivable (`flightrec distill --replay`).
 
+**Deeper docs:** [architecture & data flow](docs/architecture.md) · [desktop app internals](docs/desktop.md) · [why Nemotron](docs/why-nemotron.md) · [contributor guide (CLAUDE.md)](CLAUDE.md).
+
 ## Why Nemotron
 
 - **Continuous ambient distillation** (summarizing every session, all session long) is only economical on a fast, cheap, open model — trivial on `nvidia/nemotron-3-super-120b-a12b`, absurd on frontier API pricing.
@@ -21,53 +23,114 @@ Claude ──stdio──> memory-server ──reads──> project-state.md + no
 
 ## Setup
 
+### Desktop app (recommended)
+
+The Electron app is the viewer + control plane: browse sessions (notes, digests, raw, artifacts), manage the NVIDIA API key, wrap/unwrap MCP servers, and fix store paths if a client is writing to the wrong home.
+
+Build a downloadable macOS app (unsigned `.dmg` — right-click → Open the first time):
+
+```bash
+npm install && npm run desktop:install
+npm run desktop:dist          # → desktop/release/flightrec-*.dmg
+```
+
+Or run from the repo (use a normal terminal, not an environment that sets `ELECTRON_RUN_AS_NODE`):
+
+```bash
+npm run desktop:install       # once
+npm run desktop               # build + Electron hot reload
+# or, after desktop:install:
+cd desktop && npm start       # production build of the UI, no Vite
+```
+
+**Projects are Blender files**, not arbitrary names. New sessions land under **Unsaved** until a `.blend` path shows up in MCP traffic (e.g. `bpy.data.filepath`) or you click **Link .blend…**. Memory then hangs off that file; **Reveal** / **Open** jump to it on disk.
+
+### CLI
+
 ```bash
 npm install && npm run build
 cp .env.example .env   # or create .env with: NVIDIA_API_KEY=nvapi-...
+node dist/distill/cli.js install
+node dist/distill/cli.js install --wrap blender
+node dist/distill/cli.js uninstall
 ```
 
-Register the tap **in place of** the raw blender server, plus the memory server, in Claude Desktop config (`claude_desktop_config.json`) or Claude Code (`.mcp.json`):
+`install --wrap` sets `FLIGHTREC_HOME` to the platform app-data folder (`~/Library/Application Support/flightrec` on macOS). Optional `--project-dir <path>` overrides to `<path>/.flightrec`. **Restart the MCP client** after install so wraps pick up the new home.
+
+`install` finds Claude Code, Claude Desktop, and Cursor configs automatically, wraps the named server with the tap, and registers the memory server alongside. Claude Code uses the official `claude mcp` CLI; Desktop and Cursor get surgical JSON edits with a timestamped backup and atomic writes. Wrapped entries are self-describing, so `uninstall` restores the originals without a state file. Use `--client <claude-code|claude-desktop|cursor>` to target one client, or `--config <path>` for any config with the standard `mcpServers` shape.
+
+<details>
+<summary>Manual config (what install writes)</summary>
 
 ```json
 {
   "mcpServers": {
     "blender": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/flightrec/dist/tap.js", "--", "uvx", "blender-mcp"]
+      "args": ["/ABSOLUTE/PATH/flightrec/dist/tap.js", "--", "uvx", "blender-mcp"],
+      "env": {
+        "FLIGHTREC_HOME": "/Users/you/Library/Application Support/flightrec"
+      }
     },
     "flightrec-memory": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/flightrec/dist/memory-server.js"]
+      "args": ["/ABSOLUTE/PATH/flightrec/dist/memory-server.js"],
+      "env": {
+        "FLIGHTREC_HOME": "/Users/you/Library/Application Support/flightrec"
+      }
     }
   }
 }
 ```
+</details>
 
-That's it. The tap auto-spawns the distiller per session (opt out with `FLIGHTREC_NO_AUTODISTILL=1` and run `node dist/distill/cli.js distill --follow latest` in a terminal instead — nicer for demos).
+The tap auto-spawns the distiller per session (opt out with `FLIGHTREC_NO_AUTODISTILL=1` and run `node dist/distill/cli.js distill --follow latest` in a terminal instead — nicer for demos).
 
 ## Commands
 
 ```bash
-node dist/distill/cli.js distill --follow [session]   # tail a live session
-node dist/distill/cli.js distill --replay [session]   # re-derive digest + note from raw
+node dist/distill/cli.js distill --follow [session]   # Tier 1 only — live digests
+node dist/distill/cli.js distill --save [session]     # Tier 2 — note.md + project-state.md
+node dist/distill/cli.js distill --replay [session]   # wipe digests, re-run Tier 1 + Tier 2
+node dist/distill/cli.js export-memory [session] [--out path]   # portable agent .md
+npm run desktop                                       # viewer + control plane
 ```
+
+Tier 2 is **manual**: click **Save state** in the desktop app (or `distill --save`). Live capture only runs Tier 1. `recall()` returns existing notes/state; it does not synthesize on demand.
+
+`export-memory` writes `agent-memory.md` into the session folder (and optionally `--out` to your coding-agent project). It uses Nemotron to produce an agent-oriented brief from the session note + project state; pass `--assemble` to skip the LLM and concatenate mechanically. Requires a prior Save state (or `--assemble` without a note).
 
 `session` = `latest` (default), a session id, or a path.
 
 ## Store layout
 
+Canonical app-owned store (default):
+
 ```
-$FLIGHTREC_HOME (default ~/.flightrec)/
-  projects/<$FLIGHTREC_PROJECT, default "default">/
-    project-state.md        # durable cross-session memory (inventory, budgets, conventions)
-    decisions.jsonl         # agent-logged decisions (source of truth for the Decision log)
+~/Library/Application Support/flightrec/   # macOS
+~/.config/flightrec/                       # Linux
+%APPDATA%/flightrec/                       # Windows
+  config.json
+  .env                                     # NVIDIA_API_KEY (optional; also loads repo .env)
+  projects/_unsaved/                       # sessions before a .blend is known
+  projects/<basename>-<hash8>/             # one folder per Blender file
+    meta.json                              # { blendPath, name, … }
+    project-state.md
+    decisions.jsonl
     sessions/<ISO-timestamp>/
-      raw.jsonl             # every MCP message, complete (screenshots → artifacts/)
-      digest.jsonl          # Tier 1 structured events, every claim traceable to raw seq ids
-      note.md               # Tier 2 session note (Summary / Scene changes / Decisions / Failures & fixes / Open threads)
-      distill.log           # distiller diagnostics
-      artifacts/            # extracted screenshots
+      raw.jsonl  digest.jsonl  note.md  distill.log  artifacts/
+      session.json                         # { blendPath, projectId } once attached
+      agent-memory.md                      # optional export
 ```
+
+Project-local override (`--project-dir` or `FLIGHTREC_HOME=<workspace>/.flightrec`):
+
+```
+<workspace>/.flightrec/
+  project-state.md  decisions.jsonl  sessions/...
+```
+
+If an older wrap still points at a repo `.flightrec`, use **Setup → Fix store paths** in the desktop app (or re-run `install --wrap`), then restart the client.
 
 ## Memory tools (MCP)
 

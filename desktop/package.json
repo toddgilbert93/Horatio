@@ -1,0 +1,61 @@
+{
+  "name": "flightrec-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "flightrec viewer + control plane — capture, distill, and recall Blender MCP memory",
+  "author": "flightrec",
+  "main": "./out/main/index.cjs",
+  "scripts": {
+    "dev": "env -u ELECTRON_RUN_AS_NODE electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "env -u ELECTRON_RUN_AS_NODE electron-vite preview",
+    "start": "env -u ELECTRON_RUN_AS_NODE electron .",
+    "pack:runtime": "node ../scripts/pack-runtime.mjs",
+    "dist": "npm run pack:runtime && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false env -u ELECTRON_RUN_AS_NODE electron-builder --mac",
+    "dist:dir": "npm run pack:runtime && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false env -u ELECTRON_RUN_AS_NODE electron-builder --mac --dir"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "electron": "^34.0.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^3.0.0",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  },
+  "build": {
+    "appId": "dev.flightrec.app",
+    "productName": "flightrec",
+    "copyright": "Copyright © flightrec",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/flightrec-runtime",
+        "to": "flightrec-runtime"
+      }
+    ],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": ["dmg"],
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "identity": null
+    },
+    "dmg": {
+      "title": "flightrec"
+    }
+  }
+}

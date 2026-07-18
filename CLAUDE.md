@@ -1,199 +1,111 @@
-# flightrec — Project Brief
+# CLAUDE.md
 
-A flight recorder for MCP-driven Blender work. Ambient memory layer: capture all BlenderMCP traffic, distill it with NVIDIA Nemotron into persistent project memory, and serve that memory back to agents via a small MCP server so every future session warm-starts instead of cold-starts.
+Guidance for Claude Code (and other agents) working in this repo. Assumes the reader is editing the code, not just using the app.
 
-Built for the NVIDIA hackathon **"Best Use of NVIDIA Nemotron" bounty**. The owner is a designer-engineer (React/TypeScript) learning Blender, driving it with Claude via the `ahujasid/blender-mcp` MCP server. Everything here runs on Node/TypeScript.
+## What flightrec is
 
----
-
-## The bounty (why this project is shaped the way it is)
-
-Criteria: use any Nemotron model; **demonstrate Nemotron's centrality to the project's value**; quality AI output, impact & usefulness, creativity & differentiation; submit a short explanation of what Nemotron is doing, why it matters, and how we're maximizing its capabilities.
-
-Our centrality argument:
-1. **Continuous ambient distillation is only economical on a fast, cheap, open model.** Summarizing every session, all session long, is absurd on frontier API pricing and trivial here.
-2. **1M context** (Mamba-2 hybrid architecture) enables a one-pass full-transcript synthesis experiment (see Benchmarks).
-3. **Open weights** mean the same system can run fully local (Nemotron Nano via Ollama) — always-on, private, zero token cost. Stretch goal.
-
-The submission's spine is the **warm-start benchmark** (below). We prove the value with measurements, not claims.
-
----
-
-## Core invariant — do not violate
-
-**`raw.jsonl` is the source of truth. Everything downstream is re-derivable from it.**
-
-Digests, session notes, project state — all regenerable by re-running the distiller over raw. Consequences:
-- The tap can be dumb. It must never do anything clever.
-- Prompt changes are free: re-distill from raw.
-- Deferring any downstream work is always safe.
-
-## Architecture
+A **flight recorder for MCP-driven Blender work**. It sits transparently between an MCP client (Claude Desktop / Claude Code / Cursor) and [blender-mcp](https://github.com/ahujasid/blender-mcp), records every JSON-RPC message, distills the traffic with **NVIDIA Nemotron** into persistent memory, and serves that memory back to agents over MCP — so future sessions warm-start.
 
 ```
-Claude Desktop/Code ──stdio──> tap.ts ──stdio──> uvx blender-mcp ──tcp──> Blender addon
-                                 │
-                                 └──append──> raw.jsonl ──tail── distiller (Tier 1 → digest.jsonl)
-                                                                      └── (Tier 2 → note.md + project-state.md)
-Claude Desktop/Code ──stdio──> memory-server.ts ──reads──> project-state.md + notes
+Claude ──stdio──> tap ──stdio──> uvx blender-mcp ──tcp──> Blender
+                   │
+                   └─append─> raw.jsonl ─tail─> distiller (Nemotron)
+                                                  ├── digest.jsonl              (Tier 1: live, incremental)
+                                                  └── note.md + project-state.md (Tier 2: manual "Save state")
+Claude ──stdio──> memory-server ──reads──> project-state.md + notes   (recall / search_sessions / log_decision)
 ```
 
-Three processes, three responsibilities:
-1. **tap.ts** — transparent stdio wrapper, writes the log. Reliability-critical, dependency-free.
-2. **distiller** — separate process tailing the log; Nemotron calls live here.
-3. **memory-server.ts** — MCP server exposing recall/search/log_decision.
+## Two things that define the current design
 
-We never modify blender-mcp. We wrap it.
+1. **Projects are Blender files, not sessions.** A "project" = one `.blend` on disk, bucketed at `projects/<basename>-<hash8>/` (hash of the absolute path). A session is born under `projects/_unsaved/` and is physically **relocated** into its blend bucket the first time a `.blend` path is detected in the traffic (or linked manually). Everything downstream references a session by **id**, never a cached path, because the folder moves. See `attachSessionToBlend` in [src/lib/blend-project.ts](src/lib/blend-project.ts).
 
----
+2. **The Electron app is the viewer + control plane**, not just a demo. It browses sessions, runs "Save state" (Tier 2) and agent-memory export, manages the NVIDIA key, and wraps/unwraps MCP servers. See [desktop/](desktop/).
 
-## Component spec
+## Core invariants — do not break these
 
-### 1. tap.ts (stdio wrapper)
+- **`raw.jsonl` is the source of truth.** Everything else (`digest.jsonl`, `note.md`, `project-state.md`) is re-derivable with `distill --replay`. The only artifact that is *not* re-derivable is `decisions.jsonl` (agent-authored via `log_decision`).
+- **The tap is byte-transparent.** `process.stdin.pipe(child.stdin)` / `child.stdout.pipe(process.stdout)` is the whole forwarding path; logging is a *separate* read of the same streams and must never be able to block, delay, or crash forwarding. If you touch [src/tap.ts](src/tap.ts), preserve this: logging errors are swallowed, never thrown.
+- **base64 never hits the log.** Image payloads are extracted to `artifacts/shot-*.png` and replaced with an `image_ref` before the record is written.
+- **No speculation in distilled memory.** Digest events cite the raw-record `seq` numbers that support them; error strings are verbatim; invented causality is prompt-forbidden and schema-policed. Bad memory poisons future sessions — incomplete beats invented.
+- **`node:*` builtins only** in [src/tap.ts](src/tap.ts), [src/lib/store.ts](src/lib/store.ts), and [src/lib/blend-project.ts](src/lib/blend-project.ts). These run in the tap's process on the forwarding-critical path; keep them dependency-free.
+- **Nemotron calls are strictly serial.** All `chat()` calls funnel through one promise chain with ≥1600ms spacing (40 req/min free tier). No parallel fan-out. See [src/lib/nvidia.ts](src/lib/nvidia.ts).
 
-Registered in Claude Desktop config in place of the raw server:
-
-```json
-"blender": {
-  "command": "node",
-  "args": ["/ABSOLUTE/PATH/flightrec/dist/tap.js", "--", "uvx", "blender-mcp"]
-}
-```
-
-Same trick in Claude Code's `.mcp.json`.
-
-Rules (all mandatory, all v1):
-- Spawn everything after `--`. Pipe stdin→child.stdin and child.stdout→stdout **byte-for-byte**. Forwarding never waits on logging.
-- Separately, split streams on newlines and parse each line as JSON-RPC for logging. **A parse failure logs a raw-bytes record and changes nothing else.** Correctness never depends on parsing.
-- Capture child stderr too — Python tracebacks land there.
-- Pair requests to responses via JSON-RPC `id`. Notifications have no `id`; log them anyway.
-- **Screenshots**: `get_viewport_screenshot` results contain base64 images. Write the image to `artifacts/shot-<id>.png`, replace the payload with `{"image_ref": "artifacts/shot-<id>.png", "bytes": N}`. Never let base64 hit the log. v1-mandatory.
-- **Session boundary** = lifetime of the child process. New process → new session directory. On child exit / SIGTERM: flush and close the JSONL. Beware EPIPE on stray writes after teardown — guard all writes.
-- No MCP SDK dependency in the tap. It is pipes and line splitting.
-
-### 2. Capture format
-
-One `raw.jsonl` per session, one record per message:
-
-```json
-{"ts":"2026-07-18T19:41:03Z","dir":"req","id":42,"tool":"execute_blender_code","payload":{"code":"..."},"bytes":1834}
-{"ts":"2026-07-18T19:41:05Z","dir":"res","id":42,"status":"success","payload":{"...":"..."},"bytes":912}
-```
-
-`dir` ∈ `req | res | err | raw` (raw = unparseable line, stored verbatim). Keep code payloads and scene dumps **complete** — compaction is the distiller's job, not the recorder's. Shared types live in `lib/schema.ts`; tap writes them, distiller reads them.
-
-### 3. Distiller (separate process, one code path for live + replay)
-
-CLI: `flightrec distill --follow <session>` (tail live) and `--replay <session>` (re-derive from offset 0). Same code path — replay is the re-derivability invariant as a command.
-
-**Tier 1 — incremental digests.** Batch trigger: every **10 completed req/res pairs** or **90s of inactivity**, whichever first. One Nemotron call per batch. Output: structured events appended to `digest.jsonl`.
-
-The extraction contract — digests must be **synthesis-sufficient**, because Tier 2 sees only digests (decision, see below):
-- actions taken; the *intent* of each code payload (what the bpy code was for)
-- **error strings verbatim**, plus their resolutions if seen
-- decisions and exact parameter values ("tri budget: 15k", names, counts)
-- a scene-delta line per batch
-- batch ID + source record IDs on every event, so every downstream claim is traceable to raw
-
-**Tier 2 — session synthesis. Input = `digest.jsonl` + current `project-state.md`. NOT raw.** (Decision: keeps the call at ~10–20k tokens so it runs in seconds — the exit-time attempt can win its race, and the lazy path doesn't stall `recall()`.) Outputs:
-- `note.md` with fixed sections: Summary / Scene changes / Decisions / Failures & fixes / Open threads
-- a merged update to `project-state.md` (durable facts only: object inventory, budgets, naming conventions, known failure modes)
-
-Trigger: attempt on session end (SIGTERM handler). **Fallback: lazy — if `recall()` finds the latest session has no `note.md`, synthesize right then.** Both paths must exist.
-
-**Prompt rule for both tiers (non-negotiable): no speculation.** Every claim traceable to an event. Errors quoted verbatim. No invented causality. This output is injected into future agents' context — hallucinated memory poisons downstream sessions.
-
-### 4. Store layout
+## Layout
 
 ```
-$FLIGHTREC_HOME (default ~/.flightrec)/
-  projects/<project>/
-    project-state.md
-    sessions/<ISO-timestamp>/
-      raw.jsonl  digest.jsonl  note.md  artifacts/
+src/
+  tap.ts                 # transparent stdio wrapper; auto-spawns Tier-1 distiller by session id
+  memory-server.ts       # MCP server: recall / search_sessions / log_decision
+  install.ts             # wire tap + memory into client configs (claude mcp CLI / JSON edits)
+  lib/
+    store.ts             # store layout, session resolution, JSONL I/O  (node builtins only)
+    blend-project.ts     # .blend → project bucket, detect + attach + relocate  (node builtins only)
+    nvidia.ts            # Nemotron/OpenAI client, .env loading, serial rate limiter
+    schema.ts            # RawRecord / DigestRecord / DecisionEntry types
+  distill/
+    cli.ts               # CLI entry: install | distill --follow/--save/--replay | export-memory
+    tier1.ts             # incremental digests (live)
+    tier2.ts             # synthesis → note.md + project-state.md (manual)
+    agent-memory.ts      # portable agent-memory.md export
+    prompts.ts           # Nemotron system/user prompts + section contracts
+desktop/                 # Electron app (electron-vite). Loads compiled dist/ (dev) or bundled runtime (packaged)
+  src/main/{index,ipc,paths}.ts
+  src/preload/index.ts
+  src/renderer/{App,PreferencesApp}.tsx + components/
+  resources/flightrec-runtime/   # staged dist + node_modules + bin/node for packaging (gitignored)
+scripts/pack-runtime.mjs # stages the runtime into desktop/resources for electron-builder
+docs/why-nemotron.md
 ```
 
-- `FLIGHTREC_HOME` override supported from day one (clean-slate demo runs).
-- Everything human-readable markdown on purpose: hand-editable, diffable, renderable later.
-- Session data is **never committed** — it contains screenshots and code from real work. One **sanitized** session is checked into `examples/sample-session/` so judges can understand the system without running Blender.
-
-### 5. memory-server.ts (MCP server, official TypeScript SDK)
-
-Three tools:
-- `recall()` → returns `project-state.md` + latest `note.md` (lazy-synthesizing it if missing). Tool description must open with **"Call this first when starting work on this project"** — that phrasing is what gets agents to warm-start unprompted.
-- `search_sessions(query)` → v1: substring/grep over notes + digests. v1.5 (stretch): stuff matching notes into one Nemotron call, answer with session citations. **No embeddings, no vector store — deliberate.** At 1M context, brute force is the architecture.
-- `log_decision(text)` → append a durable fact to project-state from the driving agent. Ten minutes of work, makes memory bidirectional.
-
----
-
-## Repo structure
-
-```
-flightrec/
-  src/
-    tap.ts
-    distill/
-      cli.ts  tier1.ts  tier2.ts  prompts.ts
-    memory-server.ts
-    lib/
-      schema.ts  nvidia.ts  store.ts
-  bench/
-    tasks.md  results/
-  examples/
-    sample-session/
-  README.md
-```
-
-`prompts.ts` and `schema.ts` are load-bearing: the extraction contract and the record shape are the system's two interfaces. Keep them as named single files.
-
----
-
-## Nemotron access
-
-- Endpoint: `https://integrate.api.nvidia.com/v1` (OpenAI-compatible; standard OpenAI SDK with `baseURL` override).
-- Auth: `NVIDIA_API_KEY` env var. Never in the repo. `.env` is gitignored.
-- Default model: Nemotron 3 Super 120B for both tiers. **Verify the exact model ID string against the build.nvidia.com catalog before hardcoding** — catalog IDs are namespaced and formats vary.
-- Smoke test before building anything on top:
+## Build & run
 
 ```bash
-curl https://integrate.api.nvidia.com/v1/chat/completions \
-  -H "Authorization: Bearer $NVIDIA_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"<VERIFIED_MODEL_ID>","messages":[{"role":"user","content":"reply with just: ok"}],"max_tokens":20}'
+npm run build            # tsc → dist/   (run before desktop dev; desktop scripts chain it)
+npm run watch            # tsc -w
+
+# Desktop
+npm run desktop:install  # once: npm install in desktop/
+npm run desktop          # build + electron-vite dev (hot reload)
+npm run desktop:dist     # pack runtime + build + electron-builder --mac → desktop/release/*.dmg
+
+# CLI (after build)
+node dist/distill/cli.js install [--wrap blender] [--project-dir <path>] [--client <id>|all]
+node dist/distill/cli.js install --repair-store        # force all wraps onto app-data home
+node dist/distill/cli.js uninstall
+node dist/distill/cli.js distill --follow [session]    # Tier 1 (live digests)
+node dist/distill/cli.js distill --save   [session]    # Tier 2 (note.md + project-state.md)
+node dist/distill/cli.js distill --replay [session]    # wipe digests, re-derive Tier 1 + Tier 2
+node dist/distill/cli.js export-memory [session] [--out <path>] [--assemble]
 ```
 
-- Rate limits: free tier is **40 requests/minute** and a ~1,000-request credit pool (bump to 5,000 requested). Tier 1 batching (~1 call/min worst case) fits comfortably. Do not add fan-out parallel calls.
-- Stretch: Tier 1 on **local Nemotron Nano via Ollama** (always-on / private / zero-cost story), Tier 2 stays on Super via API — routing by stakes.
+`session` = `latest` (default) · a session id · a path.
 
----
+## Store
 
-## Benchmarks (the submission's spine — treat as first-class)
+Default is the **platform app-data home**, not the repo:
 
-1. **Warm-start benchmark.** One real Blender task, run twice from fresh agent sessions: cold (no memory server) vs. warm (`recall()` available). Metrics per run: tool calls to completion, errors hit, redundant scene queries, wall time, violations of established constraints (budgets, naming conventions). Results table goes in `bench/results/` and in the writeup.
-2. **Architecture experiment (one-off).** On the biggest recorded session, run Tier 2 the "big" way — full `raw.jsonl` in one pass — and diff its note against the digest-fed note. Validates the digest contract (or exposes its gaps) and produces the 1M-context evidence for the writeup. **Check first that the hosted endpoint accepts very large inputs** — hosted endpoints often cap input below the model's theoretical context.
+```
+~/Library/Application Support/flightrec/   (macOS)   ·   ~/.config/flightrec/ (Linux)   ·   %APPDATA%/flightrec/ (Windows)
+  config.json   .env
+  projects/_unsaved/                        # sessions before a .blend is known
+  projects/<basename>-<hash8>/
+    meta.json  project-state.md  decisions.jsonl
+    sessions/<ISO-id>/
+      raw.jsonl  digest.jsonl  note.md  distill.log  session.json  artifacts/  agent-memory.md
+```
 
----
+Resolution order: `FLIGHTREC_HOME` → app-data home. Setting `FLIGHTREC_HOME=<workspace>/.flightrec` (or `install --project-dir`) switches to a single project-local store where `projectDir()` ignores the project id.
 
-## Build order
+## Gotchas when editing
 
-1. `tap.ts` + recorder — validated end-to-end against a **real** Blender session (screenshot extraction working) before anything else.
-2. Tier 1 distiller (batcher, extraction call, `digest.jsonl`).
-3. Tier 2 + `project-state.md` merge, exit-attempt + lazy fallback.
-4. `memory-server.ts` (recall + log_decision; grep search).
-5. Benchmark runs; capture results.
-6. Stretch, in order: local Nano for Tier 1 → search v1.5 → session-timeline UI (reads `digest.jsonl` + `artifacts/`).
+- **Dev vs packaged runtime.** In dev the Electron main loads the repo's `dist/` directly ([desktop/src/main/paths.ts](desktop/src/main/paths.ts)) — so `npm run build` must have run. Packaged builds use a bundled `flightrec-runtime` with its own `bin/node`. `applyRuntimeEnv()` exports `FLIGHTREC_TAP_PATH` / `FLIGHTREC_MEMORY_PATH` / `FLIGHTREC_NODE` so install and distill spawns hit the same runtime.
+- **`ELECTRON_RUN_AS_NODE`** is deliberately unset (`env -u`) when spawning distill/electron — leaving it set turns Electron into a bare Node and breaks the app.
+- **Session env in IPC.** Desktop IPC handlers call `setProjectEnv(project)` before store reads so `FLIGHTREC_PROJECT` scopes them. CLI paths that don't set it must derive the project from the session dir (`projectIdFromSessionDir`) rather than trusting `projectName()`.
+- **Tier 2 is manual.** `--follow` (and the tap's auto-distiller) run Tier 1 only. `recall()` returns existing notes/state; it does not synthesize on demand.
+- **Batch boundaries are deterministic** (record-timestamp gaps, not wall clock), so `--replay` reproduces the batches a live run made.
 
-## Decisions already made — do not relitigate
+## MCP memory tools
 
-- Tier 2 consumes **digests**, not raw (latency + teardown reasoning above). Full-raw is a one-off experiment only.
-- **No** rolling/incremental note maintenance inside Tier 1 (bakes in early interpretations, churns tokens, makes Tier 1 stateful).
-- **No** mid-session chapter checkpoints unless a session's digest file outgrows a comfortable single call.
-- **No** embeddings/vector store.
-- **No** modifications to blender-mcp; no NemoClaw/OpenShell.
-- Standalone repo; code and data directories separate.
-
-## Known failure modes to design against
-
-- A tap that isn't transparent (blocks, reorders, or dies on parse) — kills the whole project's credibility. Boring is the spec.
-- Base64 screenshots reaching the log — bloats everything immediately.
-- Distiller inventing causality — poisons future sessions' context. The no-speculation prompt rule exists for this.
-- Tier 2 scheduled only at exit — the host process is being torn down; the lazy fallback is not optional.
+- `recall` — durable project state + latest session note for the active blend. Agents are told to call this first. Best-effort links the latest session to its `.blend` as a side effect.
+- `search_sessions(query)` — case-insensitive substring across notes, digest events, and project state, with session/batch citations. No embeddings — brute force is the architecture at 1M context.
+- `log_decision(text)` — append a durable decision (the one non-re-derivable artifact). Memory is bidirectional.

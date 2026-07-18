@@ -103,31 +103,31 @@ function stringify(v: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// Tier 2 — session synthesis (input: digests + project state, never raw)
+// Tier 2 — session synthesis (input: activity events + file memory, never raw)
 // ---------------------------------------------------------------------------
 
-export const TIER2_SYSTEM = `You are the session historian for a Blender automation project. Your input is (a) structured digest events from one work session — each already grounded in recorded evidence and tagged with a batch id — and (b) the project's current durable state file. You produce the session note and the updated project state.
+export const TIER2_SYSTEM = `You are the session historian for one Blender file. Your input is (a) structured activity events from one work session — each already grounded in recorded evidence and tagged with a batch id — and (b) the file's current durable memory. You produce the session summary and the updated file memory.
 
 Hard rules — these are absolute:
-1. Every claim in the note must be supported by the digest events. Cite batch ids in parentheses, e.g. (b0007). Multiple: (b0003, b0007).
+1. Every claim in the summary must be supported by the activity events. Cite batch ids in parentheses, e.g. (b0007). Multiple: (b0003, b0007).
 2. Error strings pass through verbatim from the events. Never paraphrase an error message.
 3. No invented causality, no speculation, no inferred plans. "Open threads" lists only things the events show were attempted but not resolved.
-4. The project state is durable memory shared across sessions. Never drop an existing fact unless this session's events directly supersede it — then update it, don't silently delete. Add new durable facts only: object inventory, budgets and constraints, naming conventions, recurring/known failure modes.
+4. File memory is durable memory shared across sessions on this Blender file. Never drop an existing fact unless this session's events directly supersede it — then update it, don't silently delete. Add new durable facts only: object inventory, budgets and constraints, naming conventions, recurring/known failure modes.
 5. Reproduce every entry under "## Decision log" exactly as given, then append this session's decision events to it.
-6. "## Scene changes" must consolidate EVERY scene_delta event from the digests — one per batch is provided; omit none. The same completeness applies to error events in "## Failures & fixes".
+6. "## Scene changes" must consolidate EVERY scene_delta event from the activity — one per batch is provided; omit none. The same completeness applies to error events in "## Failures & fixes".
 7. Do not derive new numbers. Only restate counts and totals that appear verbatim in an event; never sum or recompute them yourself.
 
-Output: a JSON object with BOTH keys, each non-empty: {"note_md": "...", "project_state_md": "..."} and nothing else.
+Output: a JSON object with BOTH keys, each non-empty: {"note_md": "...", "memory_md": "..."} and nothing else.
 
-note_md is the note for THIS session. It must contain ONLY these five section headers, in this order, and nothing else — no project state, no title:
+note_md is the session summary for THIS session. It must contain ONLY these five section headers, in this order, and nothing else — no file memory, no title:
 ## Summary
 ## Scene changes
 ## Decisions
 ## Failures & fixes
 ## Open threads
 
-project_state_md is the durable cross-session state file, returned separately and in full. It must use exactly these section headers, in this order (keep a section even when empty):
-# Project state
+memory_md is the durable cross-session file memory, returned separately and in full. It must use exactly these section headers, in this order (keep a section even when empty):
+# File memory
 ## Object inventory
 ## Budgets & constraints
 ## Naming conventions
@@ -137,7 +137,7 @@ project_state_md is the durable cross-session state file, returned separately an
 export function buildTier2User(args: {
   sessionId: string;
   events: DigestEvent[];
-  projectState: string;
+  fileMemory: string;
   decisions: DecisionEntry[];
 }): string {
   const eventLines = args.events.map((e) => {
@@ -156,12 +156,76 @@ export function buildTier2User(args: {
       : '(none)';
   return `Session: ${args.sessionId}
 
-## Digest events (${args.events.length})
+## Activity events (${args.events.length})
 ${eventLines.join('\n')}
 
-## Current project-state.md
-${args.projectState.trim() === '' ? '(empty — first session)' : args.projectState}
+## Current file memory
+${args.fileMemory.trim() === '' ? '(empty — first session)' : args.fileMemory}
 
-## Agent-logged decisions (decisions.jsonl — must all appear in the Decision log)
+## Agent-logged decisions (must all appear in the Decision log)
 ${decisionLines}`;
+}
+
+// ---------------------------------------------------------------------------
+// Agent memory export — portable .md for coding-agent folders
+// ---------------------------------------------------------------------------
+
+export const AGENT_MEMORY_SECTIONS = [
+  '## Start here',
+  '## Durable constraints',
+  '## Scene & inventory',
+  '## What happened this session',
+  '## Failures to avoid',
+  '## Open threads — continue from here',
+  '## Exact values',
+] as const;
+
+export const AGENT_MEMORY_SYSTEM = `You write a portable memory brief for a coding agent that will resume Blender MCP work on this Blender file. The file will be dropped into the agent's project folder (next to CLAUDE.md / AGENTS.md) or pasted into context. Inputs are the durable file memory plus the latest work session.
+
+Hard rules — these are absolute:
+1. Every claim must be supported by the session summary, file memory, or activity events you are given. Cite batch ids when available, e.g. (b0003).
+2. Error strings pass through verbatim. Never paraphrase an error message.
+3. No speculation, no invented plans, no guessed causality. Incomplete is correct; invented is poison.
+4. Write for an agent that has NOT seen the raw session. Be concrete: object names, budgets, naming conventions, exact parameter values.
+5. "Open threads — continue from here" lists only unresolved work visible in the inputs — actionable pick-up points, not advice.
+6. Do not invent counts. Only restate numbers that appear verbatim in the inputs.
+7. Treat "## What happened this session" as the latest work chapter for this project (not the full history).
+
+Output: a JSON object {"memory_md": "..."} and nothing else.
+
+memory_md must contain ONLY these section headers, in this order (keep a section even when empty — use "_none recorded_"):
+## Start here
+## Durable constraints
+## Scene & inventory
+## What happened this session
+## Failures to avoid
+## Open threads — continue from here
+## Exact values
+
+Do not include a title heading — the caller adds one.`;
+
+export function buildAgentMemoryUser(args: {
+  sessionId: string;
+  fileName: string;
+  noteMd: string;
+  fileMemory: string;
+  events: DigestEvent[];
+}): string {
+  const eventLines = args.events.slice(0, 200).map((e) => {
+    const bits = [`(${e.batch}) [${e.type}]`, e.summary];
+    if (e.error) bits.push(`error="${e.error.message}"`);
+    if (e.params && Object.keys(e.params).length > 0) bits.push(`params=${JSON.stringify(e.params)}`);
+    return `- ${bits.join(' — ')}`;
+  });
+  return `Blender file: ${args.fileName}
+Latest session: ${args.sessionId}
+
+## Session summary (latest work)
+${args.noteMd.trim() === '' ? '(missing)' : args.noteMd}
+
+## File memory
+${args.fileMemory.trim() === '' ? '(empty)' : args.fileMemory}
+
+## Activity events from latest session (sample / capped)
+${eventLines.length === 0 ? '(none)' : eventLines.join('\n')}`;
 }

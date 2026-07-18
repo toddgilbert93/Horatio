@@ -1,18 +1,25 @@
 {
-  "name": "flightrec",
-  "version": "0.1.0",
-  "description": "Flight recorder for MCP-driven Blender work: capture all BlenderMCP traffic, distill it with NVIDIA Nemotron into persistent project memory, serve it back via MCP.",
+  "name": "horatio",
+  "version": "0.2.0",
+  "description": "Horatio — a flight recorder for MCP-driven Blender work: capture all Blender MCP traffic, distill it with NVIDIA Nemotron into persistent per-file memory, and serve it back to agents via MCP.",
   "type": "module",
   "private": true,
   "engines": {
     "node": ">=22"
   },
   "bin": {
+    "horatio": "dist/distill/cli.js",
     "flightrec": "dist/distill/cli.js"
   },
   "scripts": {
     "build": "tsc",
-    "watch": "tsc -w"
+    "watch": "tsc -w",
+    "desktop": "npm run build && npm run dev --prefix desktop",
+    "desktop:install": "npm install --prefix desktop",
+    "desktop:build": "npm run build && npm run build --prefix desktop",
+    "desktop:dist": "npm run build && npm run dist --prefix desktop",
+    "desktop:dist:dir": "npm run build && npm run dist:dir --prefix desktop",
+    "pack:runtime": "node scripts/pack-runtime.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

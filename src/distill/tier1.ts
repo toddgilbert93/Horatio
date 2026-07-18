@@ -1,23 +1,51 @@
 /**
- * Tier 1 — incremental digestion. One code path for live tail (--follow) and
- * re-derivation (--replay): both consume the same record stream; the only
- * differences are whether we wait for new bytes and whether wall-clock
- * inactivity can trigger a flush.
+ * Live activity ("tier 1") — incremental digestion. One code path for the live
+ * tail (`watch`) and re-derivation (`rebuild`): both consume the same record
+ * stream; the only differences are whether we wait for new bytes and whether
+ * wall-clock inactivity can trigger a flush.
  *
- * Determinism rule: batch boundaries are decided by record-ts gaps wherever a
- * next record exists, so a replay reproduces the same batches a live run made.
+ * v2 changes (design §5–6):
+ *  - Every digest.jsonl writer acquires `distill.lock` for the session; a live
+ *    holder makes a second writer refuse.
+ *  - On acquire, digest.jsonl is rewritten to its maximal gap-free prefix of
+ *    ok batches (contiguous coverage); failed/beyond-gap batches are dropped
+ *    and re-digested, so coverage is a true high-water mark with no holes.
+ *  - Blend detection runs incrementally over the records already tailed.
+ *  - In follow mode, memory auto-updates at session end and after long idle.
+ *
+ * Determinism: batch boundaries are decided by record-ts gaps wherever a next
+ * record exists, so a failure-free replay reproduces the batches a live run
+ * made. Failure retries and mid-session manual catch-ups may legitimately
+ * differ (documented carve-out).
+ *
+ * Session dirs never move in v2, so paths are stable — no relocation logic.
  */
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { z } from 'zod';
 import { chat, modelId } from '../lib/nvidia.js';
 import type { BatchMeta, DigestEvent, DigestRecord, RawRecord } from '../lib/schema.js';
-import { appendJsonl, digestPath, rawPath, readJsonl } from '../lib/store.js';
+import {
+  appendJsonl,
+  atomicWrite,
+  digestPath,
+  pidAlive,
+  rawPath,
+  readJsonl,
+  readMemoryInfo,
+  readSessionInfo,
+  sessionDirById,
+  writeSessionInfo,
+} from '../lib/store.js';
+import { acquireLock, DISTILL_LOCK, LockHeldError, type LockHandle } from '../lib/locks.js';
+import { BlendDetector } from '../lib/blend-link.js';
 import { buildTier1User, TIER1_SYSTEM } from './prompts.js';
 
 const PAIRS_PER_BATCH = 10;
 const INACTIVITY_MS = 90_000;
 const POLL_MS = 500;
 const DEAD_TAP_IDLE_MS = 5 * 60_000;
+const IDLE_MEMORY_MS = 10 * 60_000; // auto memory update after this much record silence
 
 // ---------------------------------------------------------------------------
 // record stream
@@ -26,17 +54,22 @@ const DEAD_TAP_IDLE_MS = 5 * 60_000;
 export interface IdleTick {
   idleMs: number;
 }
-export type StreamItem = { record: RawRecord } | { idle: IdleTick };
+export type StreamItem = { record: RawRecord; line: string } | { idle: IdleTick };
 
 /**
- * Yields records from raw.jsonl in order, starting at fromSeq.
- * In follow mode, polls for growth and yields idle ticks while waiting so the
- * consumer can implement wall-clock triggers; ends when shouldStop() says so.
- * In replay mode, reads to EOF and ends.
+ * Yields records from raw.jsonl in order, starting at fromSeq. In follow mode,
+ * polls for growth and yields idle ticks while waiting so the consumer can
+ * implement wall-clock triggers; ends when shouldStop() says so. In replay mode,
+ * reads to EOF and ends. Each record carries its verbatim JSON line for the
+ * incremental blend detector.
  */
 export async function* recordStream(
   file: string,
-  opts: { follow: boolean; fromSeq: number; shouldStop?: (idleMs: number) => boolean }
+  opts: {
+    follow: boolean;
+    fromSeq: number;
+    shouldStop?: (idleMs: number) => boolean;
+  }
 ): AsyncGenerator<StreamItem> {
   let offset = 0;
   let partial = '';
@@ -64,12 +97,12 @@ export async function* recordStream(
           try {
             rec = JSON.parse(line) as RawRecord;
           } catch {
-            console.error('[flightrec distill] skipping unparseable raw.jsonl line');
+            console.error('[horatio watch] skipping unparseable raw.jsonl line');
             continue;
           }
           if (typeof rec.seq !== 'number' || rec.seq < opts.fromSeq) continue;
           idleSince = Date.now();
-          yield { record: rec };
+          yield { record: rec, line };
         }
       } finally {
         fs.closeSync(fd);
@@ -82,6 +115,41 @@ export async function* recordStream(
     yield { idle: { idleMs } };
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Contiguous coverage: rewrite digest.jsonl to its maximal gap-free prefix of
+// ok batches (from seq 0). Returns { coveredSeq, keptBatches } so resume can
+// continue batch numbering and pick up at coveredSeq + 1.
+// ---------------------------------------------------------------------------
+
+export function enforceContiguousDigest(digestFile: string): { coveredSeq: number; keptBatches: number } {
+  const records = readJsonl<DigestRecord>(digestFile);
+  if (records.length === 0) return { coveredSeq: -1, keptBatches: 0 };
+
+  const metas = records.filter((r): r is BatchMeta => r.kind === 'batch');
+  const okByStart = metas
+    .filter((m) => m.status === 'ok')
+    .sort((a, b) => a.srcRange[0] - b.srcRange[0]);
+
+  // Walk contiguous-from-0, collecting the batch ids that form the prefix.
+  const keep = new Set<string>();
+  let covered = -1;
+  for (const m of okByStart) {
+    if (m.srcRange[0] > covered + 1) break; // gap — stop the prefix
+    if (m.srcRange[1] > covered) {
+      keep.add(m.batch);
+      covered = m.srcRange[1];
+    }
+  }
+
+  // Rewrite to exactly the kept batch metas + their events, in original order.
+  const kept: DigestRecord[] = records.filter((r) => keep.has(r.batch));
+  if (kept.length !== records.length) {
+    const body = kept.map((r) => JSON.stringify(r)).join('\n');
+    atomicWrite(digestFile, body === '' ? '' : body + '\n');
+  }
+  return { coveredSeq: covered, keptBatches: keep.size };
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +196,7 @@ export async function runTier1Batch(
   batchId: string,
   trigger: BatchMeta['trigger'],
   digestFile: string
-): Promise<void> {
+): Promise<boolean> {
   const srcRange: [number, number] = [records[0].seq, records[records.length - 1].seq];
   const ts = records[records.length - 1].ts; // last source ts → replay-deterministic
   const meta: BatchMeta = {
@@ -153,7 +221,7 @@ export async function runTier1Batch(
       });
     } catch (err) {
       if (!(err as { truncated?: boolean }).truncated) throw err;
-      console.error(`[flightrec distill] ${batchId}: output truncated, retrying with larger cap`);
+      console.error(`[horatio watch] ${batchId}: output truncated, retrying with larger cap`);
       raw = await chat({
         system: TIER1_SYSTEM,
         user: buildTier1User(batchId, records),
@@ -164,7 +232,7 @@ export async function runTier1Batch(
     const parsed = JSON.parse(raw) as { events?: unknown[] };
     if (!Array.isArray(parsed.events)) {
       console.error(
-        `[flightrec distill] ${batchId}: model returned no events array: ${raw.slice(0, 300)}`
+        `[horatio watch] ${batchId}: model returned no events array: ${raw.slice(0, 300)}`
       );
     }
     const events: DigestEvent[] = [];
@@ -172,7 +240,7 @@ export async function runTier1Batch(
       const v = DigestEventZ.safeParse(normalizeCandidate(candidate, srcRange));
       if (!v.success) {
         console.error(
-          `[flightrec distill] ${batchId}: dropping malformed event: ${v.error.issues
+          `[horatio watch] ${batchId}: dropping malformed event: ${v.error.issues
             .map((i) => `${i.path.join('.')}: ${i.message}`)
             .join('; ')} — ${JSON.stringify(candidate).slice(0, 300)}`
         );
@@ -181,7 +249,7 @@ export async function runTier1Batch(
       // Traceability guard: sources must exist within this batch.
       const src = v.data.src.filter((s) => s >= srcRange[0] && s <= srcRange[1]);
       if (src.length === 0) {
-        console.error(`[flightrec distill] ${batchId}: dropping event with out-of-range src`);
+        console.error(`[horatio watch] ${batchId}: dropping event with out-of-range src`);
         continue;
       }
       events.push({ kind: 'event', batch: batchId, ts, ...v.data, src });
@@ -189,12 +257,15 @@ export async function runTier1Batch(
     appendJsonl(digestFile, meta);
     for (const e of events) appendJsonl(digestFile, e);
     console.error(
-      `[flightrec distill] ${batchId} ok: ${events.length} events from seq ${srcRange[0]}-${srcRange[1]} (${trigger})`
+      `[horatio watch] ${batchId} ok: ${events.length} events from seq ${srcRange[0]}-${srcRange[1]} (${trigger})`
     );
+    return true;
   } catch (err) {
-    // Never fabricate: record the failure and move on; --replay retries it.
+    // Never fabricate: record the failure and move on; the range is re-digested
+    // on the next pass (it does not advance contiguous coverage).
     appendJsonl(digestFile, { ...meta, status: 'failed' } satisfies BatchMeta);
-    console.error(`[flightrec distill] ${batchId} FAILED: ${String(err)}`);
+    console.error(`[horatio watch] ${batchId} FAILED: ${String(err)}`);
+    return false;
   }
 }
 
@@ -226,56 +297,92 @@ function normalizeCandidate(candidate: unknown, srcRange: [number, number]): unk
 }
 
 // ---------------------------------------------------------------------------
-// the distiller run loop (shared by --follow and --replay)
+// the run loop (shared by watch and rebuild)
 // ---------------------------------------------------------------------------
 
 export interface Tier1Result {
   sawSessionEnd: boolean;
+  endedViaDeadTap: boolean;
   batchesRun: number;
+  coveredSeq: number;
 }
 
+/**
+ * Digest a session's raw.jsonl. Acquires distill.lock for its whole run; a
+ * live holder throws LockHeldError (caller decides exit). In follow mode,
+ * auto-updates memory at session end and after long idle unless
+ * HORATIO_NO_AUTOMEMORY=1.
+ */
 export async function runTier1(
   sessionDir: string,
   opts: { follow: boolean }
 ): Promise<Tier1Result> {
-  const raw = rawPath(sessionDir);
-  const digestFile = digestPath(sessionDir);
+  const sessionId = path.basename(sessionDir);
+  const dir = fs.existsSync(sessionDir) ? sessionDir : sessionDirById(sessionId);
+  const raw = rawPath(dir);
+  const digestFile = digestPath(dir);
 
-  // Resume support: continue after the last completed batch.
-  let batchCounter = 0;
-  let fromSeq = 0;
-  const existing = readJsonl<DigestRecord>(digestFile);
-  const metas = existing.filter((r): r is BatchMeta => r.kind === 'batch');
-  if (metas.length > 0) {
-    batchCounter = metas.length;
-    fromSeq = Math.max(...metas.map((m) => m.srcRange[1])) + 1;
+  let lock: LockHandle;
+  try {
+    lock = acquireLock(path.join(dir, DISTILL_LOCK));
+  } catch (err) {
+    if (err instanceof LockHeldError) {
+      console.error(`[horatio watch] ${sessionId}: another distiller holds the lock (pid ${err.holderPid ?? '?'}) — exiting`);
+    }
+    throw err;
   }
+
+  try {
+    return await runTier1Locked(dir, raw, digestFile, opts);
+  } finally {
+    lock.release();
+  }
+}
+
+async function runTier1Locked(
+  dir: string,
+  raw: string,
+  digestFile: string,
+  opts: { follow: boolean }
+): Promise<Tier1Result> {
+  // Resume from a clean contiguous coverage baseline.
+  const { coveredSeq: startCovered, keptBatches } = enforceContiguousDigest(digestFile);
+  let batchCounter = keptBatches;
+  const fromSeq = startCovered + 1;
+
+  const detector = new BlendDetector({ id: path.basename(dir), dir });
 
   let buffer: RawRecord[] = [];
   let pairsDone = 0;
   let tapPid: number | undefined;
   let sawSessionEnd = false;
+  let endedViaDeadTap = false;
   let batchesRun = 0;
+  let coveredSeq = startCovered;
+  let lastMemorySeq = readMemoryCoverage(dir);
+  let idleMemoryArmed = true;
 
-  const flush = async (trigger: BatchMeta['trigger']) => {
+  const flush = async (trigger: BatchMeta['trigger']): Promise<void> => {
     if (buffer.length === 0) return;
     const id = `b${String(++batchCounter).padStart(4, '0')}`;
     const records = buffer;
+    const lastSeq = records[records.length - 1].seq;
     buffer = [];
     pairsDone = 0;
-    await runTier1Batch(records, id, trigger, digestFile);
+    const ok = await runTier1Batch(records, id, trigger, digestFile);
     batchesRun++;
+    if (ok) coveredSeq = lastSeq; // contiguous because we flush in order
   };
 
   const shouldStop = (idleMs: number): boolean => {
     if (idleMs < DEAD_TAP_IDLE_MS) return false;
-    if (tapPid === undefined) return true; // never saw session_start; nothing to wait for
-    try {
-      process.kill(tapPid, 0);
-      return false; // tap alive — keep waiting
-    } catch {
-      return true; // tap gone and log quiet for 5 min → treat as ended
+    if (tapPid === undefined) {
+      endedViaDeadTap = true;
+      return true; // never saw session_start; nothing to wait for
     }
+    if (pidAlive(tapPid)) return false; // tap alive — keep waiting
+    endedViaDeadTap = true;
+    return true; // tap gone and log quiet → treat as ended
   };
 
   for await (const item of recordStream(raw, { follow: opts.follow, fromSeq, shouldStop })) {
@@ -283,9 +390,35 @@ export async function runTier1(
       if (item.idle.idleMs >= INACTIVITY_MS && buffer.length > 0) {
         await flush('inactivity');
       }
+      // Idle memory update: after a long quiet stretch, fold what's been
+      // digested into durable memory (fires once per quiet stretch).
+      if (
+        opts.follow &&
+        idleMemoryArmed &&
+        item.idle.idleMs >= IDLE_MEMORY_MS &&
+        buffer.length === 0 &&
+        coveredSeq > lastMemorySeq
+      ) {
+        idleMemoryArmed = false;
+        await autoUpdateMemory(dir, 'idle');
+        lastMemorySeq = readMemoryCoverage(dir);
+      }
       continue;
     }
     const rec = item.record;
+    idleMemoryArmed = true; // new traffic re-arms the idle trigger
+
+    // Incremental blend detection over the record's verbatim line.
+    try {
+      const linked = detector.feed(item.line);
+      if (linked) {
+        console.error(
+          `[horatio watch] ${linked.rebound ? 're-linked' : 'linked'} to ${path.basename(linked.link.blendPath)} (${linked.link.confidence})`
+        );
+      }
+    } catch {
+      /* detection must never break digestion */
+    }
 
     if (rec.dir === 'meta') {
       if (rec.meta?.event === 'session_start') tapPid = rec.meta.tapPid;
@@ -314,5 +447,51 @@ export async function runTier1(
 
   // EOF in replay mode (or follow ended via shouldStop) with records buffered.
   await flush(sawSessionEnd ? 'session_end' : 'inactivity');
-  return { sawSessionEnd, batchesRun };
+
+  // Dead-tap exit: the tap could not stamp its own end — record it (the sole
+  // allowed cross-writer touch of session.json, and only because the tap is
+  // gone).
+  if (endedViaDeadTap && opts.follow) {
+    stampInactivityEnd(dir);
+  }
+
+  // Auto memory at session end / dead-tap end (follow only).
+  if (opts.follow && (sawSessionEnd || endedViaDeadTap)) {
+    await autoUpdateMemory(dir, 'session_end');
+  }
+
+  return { sawSessionEnd, endedViaDeadTap, batchesRun, coveredSeq };
+}
+
+function readMemoryCoverage(dir: string): number {
+  return readMemoryInfo(dir)?.coveredSeq ?? -1;
+}
+
+function stampInactivityEnd(dir: string): void {
+  try {
+    const info = readSessionInfo(dir);
+    if (info && !info.endedAt) {
+      writeSessionInfo(dir, {
+        ...info,
+        endedAt: new Date().toISOString(),
+        endReason: 'inactivity',
+      });
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Run the memory update, isolating its failures from the digestion path. */
+async function autoUpdateMemory(dir: string, trigger: 'session_end' | 'idle'): Promise<void> {
+  if (process.env.HORATIO_NO_AUTOMEMORY === '1') return;
+  try {
+    const { updateMemory } = await import('./tier2.js');
+    const res = await updateMemory(dir, { trigger });
+    if (!res.skipped) {
+      console.error(`[horatio watch] memory updated (${trigger})`);
+    }
+  } catch (err) {
+    console.error(`[horatio watch] auto memory update failed (ignored): ${String(err)}`);
+  }
 }
