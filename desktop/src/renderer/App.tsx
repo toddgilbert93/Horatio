@@ -78,6 +78,9 @@ export default function App() {
   // first sight (no dots at startup); a later mtime means unseen activity.
   const [seenMtimes, setSeenMtimes] = useState<Record<string, number>>({})
   const baselinedRef = useRef(false)
+  // Digest mtimes from the previous refresh — lets a watch-triggered refresh
+  // spot which sessions actually gained activity, to auto-jump the viewer.
+  const lastMtimesRef = useRef<Record<string, number>>({})
 
   const markSeen = useCallback((s: SessionListItem) => {
     setSeenMtimes((prev) => ({ ...prev, [s.id]: s.digestMtimeMs ?? 0 }))
@@ -127,7 +130,7 @@ export default function App() {
   )
 
   const refresh = useCallback(
-    async (preferId?: string | null) => {
+    async (preferId?: string | null, opts?: { jumpToLatest?: boolean }) => {
       const [list, projs] = await Promise.all([
         window.flightrec.listAllSessions(),
         window.flightrec.listProjects(),
@@ -153,7 +156,26 @@ export default function App() {
           : filter === '_unlinked'
             ? list.filter((s) => !s.blendId)
             : list.filter((s) => s.blendId === filter)
-      await pickSession(visible, preferId)
+
+      // Follow the action: on watch-triggered refreshes, jump to the visible
+      // session whose digest advanced most recently (if any did).
+      let jumpId: string | null = null
+      if (opts?.jumpToLatest) {
+        const prev = lastMtimesRef.current
+        const advanced = visible.filter(
+          (s) => (s.digestMtimeMs ?? 0) > (prev[s.id] ?? 0)
+        )
+        if (advanced.length > 0) {
+          jumpId = advanced.reduce((a, b) =>
+            (b.digestMtimeMs ?? 0) > (a.digestMtimeMs ?? 0) ? b : a
+          ).id
+        }
+      }
+      lastMtimesRef.current = Object.fromEntries(
+        list.map((s) => [s.id, s.digestMtimeMs ?? 0])
+      )
+
+      await pickSession(visible, jumpId ?? preferId)
     },
     [pickSession]
   )
@@ -170,7 +192,7 @@ export default function App() {
       }
     })()
     const unsub = window.flightrec.onWatchChanged(() => {
-      void refresh(selectedRef.current?.id)
+      void refresh(selectedRef.current?.id, { jumpToLatest: true })
     })
     return () => {
       unsub()
