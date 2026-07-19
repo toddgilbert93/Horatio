@@ -43,7 +43,7 @@ export function BustViewer({
         maxWidth: 300,
         maxHeight: 300,
         aspectRatio: '1 / 1',
-        background: '#041300',
+        background: 'var(--background, #041300)',
         overflow: 'hidden',
         ...style,
       }}

@@ -22,3 +22,4 @@ desktop/out/
 desktop/dist/
 desktop/release/
 desktop/resources/flightrec-runtime/
+*.tsbuildinfo

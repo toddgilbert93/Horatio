@@ -19,10 +19,10 @@ import type { BlendMeta, DigestEvent, DigestRecord, LinkInfo, SessionInfo } from
 import {
   appendDecision,
   appendSessionDecision,
-  currentLiveSession,
   decisionsPathForSession,
   digestPath,
   listBlendMetas,
+  listLiveSessions,
   listSessions,
   MigrationNeededError,
   notePath,
@@ -131,6 +131,26 @@ function blendsByFileArg(file: string): BlendMeta[] {
   );
 }
 
+/**
+ * Has this session distilled anything worth warm-starting from? A tap that
+ * just booted holds a live pointer and a fresh raw.jsonl (handshake,
+ * tools/list) but has nothing to say yet. Live pointers rank by raw.jsonl
+ * mtime, so without this check a client that just opened resolves to its OWN
+ * empty session — purely because it wrote last.
+ */
+function hasSubstance(session: SessionRef): boolean {
+  try {
+    return readJsonl<DigestRecord>(digestPath(session.dir)).some((r) => r.kind === 'event');
+  } catch {
+    return false;
+  }
+}
+
+/** Ids of every live tap — several clients can be recording at once. */
+function liveIds(): Set<string> {
+  return new Set(listLiveSessions().map((s) => s.id));
+}
+
 /** Latest session tagged to a blend (listSessions is newest-first). */
 function latestSessionForBlend(blendId: string): SessionRef | undefined {
   for (const s of listSessions()) {
@@ -149,8 +169,7 @@ function resolveSession(opts: { session?: string; file?: string }): ResolveResul
   if (opts.session && opts.session.trim() !== '') {
     const matches = sessionsByArg(opts.session);
     if (matches.length === 1) {
-      const liveId = currentLiveSession()?.id;
-      return { kind: 'ok', target: hydrate(matches[0], matches[0].id === liveId) };
+      return { kind: 'ok', target: hydrate(matches[0], liveIds().has(matches[0].id)) };
     }
     if (matches.length > 1) {
       return {
@@ -173,13 +192,11 @@ function resolveSession(opts: { session?: string; file?: string }): ResolveResul
       };
     }
     if (blends.length === 1) {
-      const live = currentLiveSession();
-      if (live) {
-        const link = readLink(live.dir);
-        if (link?.blendId === blends[0].id) {
-          return { kind: 'ok', target: hydrate(live, true) };
-        }
-      }
+      // Any live tap tagged to this blend beats mtime order — a second client
+      // recording elsewhere must not shadow the one actually on this file.
+      const live = listLiveSessions().find((s) => readLink(s.dir)?.blendId === blends[0].id);
+      if (live) return { kind: 'ok', target: hydrate(live, true) };
+
       const latest = latestSessionForBlend(blends[0].id);
       if (latest) return { kind: 'ok', target: hydrate(latest, false) };
       return { kind: 'none' };
@@ -187,11 +204,14 @@ function resolveSession(opts: { session?: string; file?: string }): ResolveResul
     return { kind: 'none' };
   }
 
-  const live = currentLiveSession();
-  if (live) return { kind: 'ok', target: hydrate(live, true) };
+  // Most recently active live tap that has actually distilled something. Skips
+  // the just-booted-client case; falls through to history when every tap is new.
+  const substantiveLive = listLiveSessions().find(hasSubstance);
+  if (substantiveLive) return { kind: 'ok', target: hydrate(substantiveLive, true) };
 
-  const newest = listSessions()[0];
-  if (newest) return { kind: 'ok', target: hydrate(newest, false) };
+  const all = listSessions();
+  const newest = all.find(hasSubstance) ?? all[0];
+  if (newest) return { kind: 'ok', target: hydrate(newest, liveIds().has(newest.id)) };
 
   return { kind: 'none' };
 }

@@ -113,7 +113,9 @@ export interface SessionInfo {
   id: string;
   startedAt: string;
   endedAt?: string;
-  endReason?: 'session_end' | 'inactivity';
+  /** 'rotated' = the tap closed this session after a long idle gap and kept
+   *  running with a fresh one (long-lived MCP clients never restart the tap). */
+  endReason?: 'session_end' | 'inactivity' | 'rotated';
   tapPid?: number;
   cmd?: string[];
   /** Short AI-generated label (3–6 words), set by Tier 1 on first ok batch. */
