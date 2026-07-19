@@ -9,7 +9,11 @@
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "noEmit": true,
-    "target": "ES2022"
+    "target": "ES2022",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/renderer/*"]
+    }
   },
   "include": ["src/main/**/*", "src/preload/**/*", "electron.vite.config.ts"]
 }

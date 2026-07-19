@@ -40,8 +40,9 @@ export function bundledNodePath(): string | undefined {
 }
 
 export function resolveNodeExecutable(): string {
-  if (process.env.FLIGHTREC_NODE && process.env.FLIGHTREC_NODE.trim() !== '') {
-    const preferred = process.env.FLIGHTREC_NODE.trim();
+  const preferredEnv = process.env.HORATIO_NODE || process.env.FLIGHTREC_NODE;
+  if (preferredEnv && preferredEnv.trim() !== '') {
+    const preferred = preferredEnv.trim();
     // Never use the Electron binary as node — spawn hangs / misbehaves.
     if (!preferred.includes('Electron') && existsSync(preferred)) return preferred;
   }
@@ -60,14 +61,24 @@ export function resolveNodeExecutable(): string {
 /** Apply env so install.js / distill find the same runtime the app is using. */
 export function applyRuntimeEnv(): void {
   const root = runtimeRoot();
+  process.env.HORATIO_RUNTIME = root;
+  process.env.HORATIO_REPO_ROOT = REPO_ROOT;
+  // Legacy keys still read by older code paths / envWithFallback.
   process.env.FLIGHTREC_RUNTIME = root;
   process.env.FLIGHTREC_REPO_ROOT = REPO_ROOT;
   const node = resolveNodeExecutable();
+  process.env.HORATIO_NODE = node;
   process.env.FLIGHTREC_NODE = node;
   const tap = join(root, 'tap.js');
   const memory = join(root, 'memory-server.js');
-  if (existsSync(tap)) process.env.FLIGHTREC_TAP_PATH = tap;
-  if (existsSync(memory)) process.env.FLIGHTREC_MEMORY_PATH = memory;
+  if (existsSync(tap)) {
+    process.env.HORATIO_TAP_PATH = tap;
+    process.env.FLIGHTREC_TAP_PATH = tap;
+  }
+  if (existsSync(memory)) {
+    process.env.HORATIO_MEMORY_PATH = memory;
+    process.env.FLIGHTREC_MEMORY_PATH = memory;
+  }
 }
 
 export async function loadDist<T>(rel: string): Promise<T> {

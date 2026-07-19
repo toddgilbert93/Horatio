@@ -1,34 +1,35 @@
 /**
  * IPC handlers — store reads, install/control, watchers, migration.
+ * Talks to the compiled dist/ (v2 Horatio store: flat sessions + blends/).
  */
 import type { IpcMain, Shell } from 'electron';
-import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
-import { REPO_ROOT, loadDist, applyRuntimeEnv, resolveNodeExecutable, runtimeRoot, isPackaged } from './paths';
+import { REPO_ROOT, loadDist, applyRuntimeEnv, runtimeRoot, isPackaged } from './paths';
 
 type StoreMod = typeof import('../../../dist/lib/store.js');
+type BlendLinkMod = typeof import('../../../dist/lib/blend-link.js');
 type InstallMod = typeof import('../../../dist/install.js');
 
+const UNLINKED_ID = '_unlinked';
+
 let store: StoreMod;
+let blendLink: BlendLinkMod;
 let install: InstallMod;
 let watchers: fs.FSWatcher[] = [];
 
 async function ensureMods(): Promise<void> {
   applyRuntimeEnv();
   if (!store) store = await loadDist<StoreMod>('lib/store.js');
+  if (!blendLink) blendLink = await loadDist<BlendLinkMod>('lib/blend-link.js');
   if (!install) install = await loadDist<InstallMod>('install.js');
 }
 
-function setProjectEnv(project: string): void {
-  process.env.FLIGHTREC_PROJECT = project;
-}
-
-function artifactCount(sessionDir: string): number {
-  const artifacts = store.artifactsDir(sessionDir);
-  if (!fs.existsSync(artifacts)) return 0;
-  return fs.readdirSync(artifacts).filter((f) => /\.(png|jpe?g|webp|gif)$/i.test(f)).length;
+function bindHomeEnv(): void {
+  const home = store.horatioHome();
+  process.env.HORATIO_HOME = home;
+  // Legacy key still read by older wraps / envWithFallback.
+  process.env.FLIGHTREC_HOME = home;
 }
 
 function sessionSummary(s: { id: string; dir: string }) {
@@ -39,17 +40,127 @@ function sessionSummary(s: { id: string; dir: string }) {
     hasDigest: fs.existsSync(store.digestPath(s.dir)),
     hasRaw: fs.existsSync(store.rawPath(s.dir)),
     hasDistillLog: fs.existsSync(store.distillLogPath(s.dir)),
-    artifactCount: artifactCount(s.dir),
+    artifactCount: 0,
   };
 }
 
-function artifactUrl(abs: string): string {
-  return `flightrec-file://local/?p=${encodeURIComponent(abs)}`;
+function sessionsForBlend(blendId: string): Array<{ id: string; dir: string; blendId?: string }> {
+  const all = blendLink.listSessionsWithLinks();
+  if (blendId === UNLINKED_ID) return all.filter((s) => !s.blendId);
+  return all.filter((s) => s.blendId === blendId);
+}
+
+// ---------------------------------------------------------------------------
+// Session merge markers — sources keep their folders (raw.jsonl untouched);
+// merge.json points at the target and the UI folds their feeds together.
+// ---------------------------------------------------------------------------
+
+const MERGE_FILE = 'merge.json';
+
+type MergeInfo = { mergedInto: string; at: string };
+
+function readMergeInfo(sessionDir: string): MergeInfo | undefined {
+  try {
+    const raw = fs.readFileSync(path.join(sessionDir, MERGE_FILE), 'utf8');
+    const parsed = JSON.parse(raw) as MergeInfo;
+    return parsed?.mergedInto ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function mergeSourcesFor(targetId: string): Array<{ id: string; dir: string }> {
+  return store
+    .listSessions()
+    .filter((s) => readMergeInfo(s.dir)?.mergedInto === targetId);
+}
+
+type DigestRow = {
+  kind?: string;
+  ts?: string;
+  artifacts?: string[];
+  [k: string]: unknown;
+};
+
+/** Target digest + digests of sessions merged into it, events sorted by ts.
+ *  Source artifact paths are rewritten absolute so thumbnails resolve. */
+function combinedDigest(sessionDir: string, sessionId: string): DigestRow[] {
+  const own = store.readJsonl(store.digestPath(sessionDir)) as DigestRow[];
+  const sources = mergeSourcesFor(sessionId);
+  if (sources.length === 0) return own;
+
+  const rows: DigestRow[] = [...own];
+  for (const src of sources) {
+    for (const row of store.readJsonl(store.digestPath(src.dir)) as DigestRow[]) {
+      if (row.kind === 'event' && Array.isArray(row.artifacts)) {
+        rows.push({
+          ...row,
+          artifacts: row.artifacts.map((rel) =>
+            rel.startsWith('/') ? rel : path.join(src.dir, rel)
+          ),
+        });
+      } else {
+        rows.push(row);
+      }
+    }
+  }
+  return rows.sort((a, b) => String(a.ts ?? '').localeCompare(String(b.ts ?? '')));
+}
+
+function listProjectInfos(): Array<{
+  id: string;
+  name: string;
+  blendPath: string;
+  sessionCount: number;
+  blendExists: boolean;
+  dir: string;
+}> {
+  const blends = blendLink.listBlendInfos().map((b) => ({
+    id: b.id,
+    name: b.name,
+    blendPath: b.blendPath,
+    sessionCount: b.sessionCount,
+    blendExists: b.blendExists,
+    dir: b.dir,
+  }));
+  const unlinked = blendLink.listSessionsWithLinks().filter((s) => !s.blendId);
+  if (unlinked.length > 0) {
+    blends.unshift({
+      id: UNLINKED_ID,
+      name: 'Unlinked sessions',
+      blendPath: '',
+      sessionCount: unlinked.length,
+      blendExists: false,
+      dir: store.sessionsRoot(),
+    });
+  }
+  return blends;
+}
+
+/** Best-effort: detect + link any still-unlinked sessions from raw traffic. */
+function relinkSessions(): void {
+  for (const s of store.listSessions()) {
+    try {
+      const existing = store.readLink(s.dir);
+      if (existing && (existing.via === 'manual' || existing.confidence === 'explicit')) continue;
+      const hit = blendLink.detectBlendPathFromRaw(s.dir);
+      if (hit) blendLink.linkSession(s, hit.blendPath, 'detected', hit.confidence);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void> {
   await ensureMods();
-  store.ensureFlightrecHome();
+  try {
+    store.ensureV2Home();
+  } catch (err) {
+    // v1 store: still register handlers so Preferences can run migrate.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[horatio] store not ready:', msg);
+  }
+  bindHomeEnv();
   applyRuntimeEnv();
 
   // OpenAI SDK's default fetch hangs in Electron main — bind Chromium net.fetch.
@@ -63,15 +174,15 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
       setElectronFetch(eNet.fetch.bind(eNet) as typeof fetch);
     }
   } catch (err) {
-    console.error('[flightrec] could not bind electron net.fetch', err);
+    console.error('[horatio] could not bind electron net.fetch', err);
   }
 
   ipcMain.handle('home:get', async () => {
     await ensureMods();
     return {
-      home: store.flightrecHome(),
+      home: store.horatioHome(),
       defaultHome: store.defaultAppDataHome(),
-      project: store.projectName(),
+      project: store.readAppConfig().lastBlendId ?? '',
       packaged: isPackaged(),
       runtime: runtimeRoot(),
     };
@@ -79,7 +190,9 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
 
   ipcMain.handle('home:ensure', async () => {
     await ensureMods();
-    return store.ensureFlightrecHome();
+    const home = store.ensureV2Home();
+    bindHomeEnv();
+    return home;
   });
 
   ipcMain.handle('config:get', async () => {
@@ -89,26 +202,21 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
 
   ipcMain.handle('config:set', async (_e, patch: Record<string, unknown>) => {
     await ensureMods();
-    const cfg = { ...store.readAppConfig(), ...patch };
+    // Accept lastProject from older UI builds as lastBlendId.
+    const normalized = { ...patch };
+    if (typeof normalized.lastProject === 'string' && normalized.lastBlendId === undefined) {
+      normalized.lastBlendId = normalized.lastProject;
+      delete normalized.lastProject;
+    }
+    const cfg = { ...store.readAppConfig(), ...normalized };
     store.writeAppConfig(cfg);
     return cfg;
   });
 
   ipcMain.handle('projects:list', async () => {
     await ensureMods();
-    const { listProjectInfos, ensureUnsavedProject, attachSessionToBlend } =
-      await loadDist<typeof import('../../../dist/lib/blend-project.js')>('lib/blend-project.js');
-    ensureUnsavedProject();
-    // Re-scan sessions for blend paths so the UI stays current
-    for (const p of listProjectInfos()) {
-      for (const s of store.listSessions(p.id)) {
-        try {
-          attachSessionToBlend(s);
-        } catch {
-          /* ignore */
-        }
-      }
-    }
+    store.ensureV2Home();
+    relinkSessions();
     return listProjectInfos();
   });
 
@@ -125,14 +233,12 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
       return { ok: false, canceled: true };
     }
     const blendPath = result.filePaths[0];
-    const { ensureProjectForBlend, attachSessionToBlend, listProjectInfos } =
-      await loadDist<typeof import('../../../dist/lib/blend-project.js')>('lib/blend-project.js');
-    const meta = ensureProjectForBlend(blendPath);
-    // If linking from a specific legacy/unsaved project, move its sessions over
-    if (projectId && projectId !== meta.id) {
-      for (const s of store.listSessions(projectId)) {
+    const meta = blendLink.ensureBlendForPath(blendPath);
+    // Link sessions currently in the selected group onto this .blend.
+    if (projectId) {
+      for (const s of sessionsForBlend(projectId)) {
         try {
-          attachSessionToBlend(s, blendPath);
+          blendLink.linkSessionManually(s, blendPath);
         } catch {
           /* ignore */
         }
@@ -155,97 +261,175 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
 
   ipcMain.handle('sessions:list', async (_e, project: string) => {
     await ensureMods();
-    setProjectEnv(project);
-    return store.listSessions(project).map(sessionSummary);
+    return sessionsForBlend(project).map(sessionSummary);
   });
 
-  ipcMain.handle('project:timeline', async (_e, project: string) => {
+  /** Flat session list across all blends — primary desktop navigation. */
+  ipcMain.handle('sessions:list-all', async () => {
     await ensureMods();
-    setProjectEnv(project);
-    return store.listSessions(project).map((s) => ({
-      ...sessionSummary(s),
-      records: store.readJsonl(store.digestPath(s.dir)),
-    }));
-  });
-
-  ipcMain.handle('project:notes', async (_e, project: string) => {
-    await ensureMods();
-    setProjectEnv(project);
-    const out: Array<{ sessionId: string; note: string }> = [];
-    for (const s of store.listSessions(project)) {
-      const f = path.join(s.dir, 'note.md');
-      if (!fs.existsSync(f)) continue;
-      const note = fs.readFileSync(f, 'utf8');
-      if (note.trim()) out.push({ sessionId: s.id, note });
-    }
-    return out;
-  });
-
-  ipcMain.handle('project:artifacts', async (_e, project: string) => {
-    await ensureMods();
-    setProjectEnv(project);
-    const out: Array<{ sessionId: string; name: string; path: string; url: string }> = [];
-    for (const s of store.listSessions(project)) {
-      const dir = store.artifactsDir(s.dir);
-      if (!fs.existsSync(dir)) continue;
-      for (const name of fs
-        .readdirSync(dir)
-        .filter((f) => /\.(png|jpe?g|webp|gif)$/i.test(f))
-        .sort()
-        .reverse()) {
-        const abs = path.join(dir, name);
-        out.push({ sessionId: s.id, name, path: abs, url: artifactUrl(abs) });
+    store.ensureV2Home();
+    relinkSessions();
+    const out: Array<{
+      id: string;
+      dir: string;
+      title?: string;
+      startedAt?: string;
+      endedAt?: string;
+      blendId?: string;
+      blendName?: string;
+      hasDigest: boolean;
+    }> = [];
+    for (const s of store.listSessions()) {
+      if (readMergeInfo(s.dir)) continue; // folded into another session
+      const info = store.readSessionInfo(s.dir);
+      const link = store.readLink(s.dir);
+      let blendName: string | undefined;
+      if (link?.blendId) {
+        const meta = store.readBlendMeta(link.blendId);
+        blendName = meta?.name || path.basename(link.blendPath || '');
       }
+      out.push({
+        id: s.id,
+        dir: s.dir,
+        title: info?.title,
+        startedAt: info?.startedAt,
+        endedAt: info?.endedAt,
+        blendId: link?.blendId,
+        blendName: blendName || undefined,
+        hasDigest: fs.existsSync(store.digestPath(s.dir)),
+      });
     }
-    return out;
-  });
-
-  ipcMain.handle('session:note', async (_e, sessionDir: string) => {
-    const f = path.join(sessionDir, 'note.md');
-    return fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '';
+    return out; // listSessions() is already newest-first
   });
 
   ipcMain.handle('session:digest', async (_e, sessionDir: string) => {
     await ensureMods();
-    return store.readJsonl(store.digestPath(sessionDir));
+    return combinedDigest(sessionDir, path.basename(sessionDir));
   });
 
-  ipcMain.handle('session:raw', async (_e, sessionDir: string, limit = 500) => {
+  /** Fold source sessions into a target; optionally retag target to a .blend. */
+  ipcMain.handle(
+    'sessions:merge',
+    async (_e, sourceIds: string[], targetId: string, blendPath?: string) => {
+      await ensureMods();
+      const targetDir = store.sessionDirById(targetId);
+      if (!fs.existsSync(targetDir)) return { ok: false, error: `target session not found: ${targetId}` };
+      const at = new Date().toISOString();
+      let merged = 0;
+      for (const id of sourceIds) {
+        if (id === targetId) continue;
+        const dir = store.sessionDirById(id);
+        if (!fs.existsSync(dir)) continue;
+        store.atomicWrite(
+          path.join(dir, MERGE_FILE),
+          JSON.stringify({ mergedInto: targetId, at } satisfies MergeInfo, null, 2) + '\n'
+        );
+        merged++;
+      }
+      if (blendPath) {
+        try {
+          blendLink.linkSessionManually({ id: targetId, dir: targetDir }, blendPath);
+        } catch (err) {
+          return { ok: true, merged, error: `merged, but retag failed: ${String(err)}` };
+        }
+      }
+      return { ok: true, merged };
+    }
+  );
+
+  /** Retag one session onto a .blend (manual link always wins). */
+  ipcMain.handle('session:link', async (_e, sessionId: string, blendPath: string) => {
     await ensureMods();
-    const rows = store.readJsonl(store.rawPath(sessionDir));
-    return rows.slice(-limit);
+    const dir = store.sessionDirById(sessionId);
+    if (!fs.existsSync(dir)) return { ok: false, error: `session not found: ${sessionId}` };
+    try {
+      blendLink.linkSessionManually({ id: sessionId, dir }, blendPath);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
   });
 
-  ipcMain.handle('session:distillLog', async (_e, sessionDir: string) => {
-    await ensureMods();
-    const f = store.distillLogPath(sessionDir);
-    if (!fs.existsSync(f)) return '';
-    const text = fs.readFileSync(f, 'utf8');
-    return text.length > 100_000 ? text.slice(-100_000) : text;
-  });
-
-  ipcMain.handle('session:artifacts', async (_e, sessionDir: string) => {
-    await ensureMods();
-    const dir = store.artifactsDir(sessionDir);
-    if (!fs.existsSync(dir)) return [];
-    return fs
-      .readdirSync(dir)
-      .filter((f) => /\.(png|jpe?g|webp|gif)$/i.test(f))
-      .sort()
-      .map((name) => {
-        const abs = path.join(dir, name);
-        return { name, path: abs, url: artifactUrl(abs) };
-      });
-  });
-
-  ipcMain.handle('project:state', async (_e, project: string) => {
-    await ensureMods();
-    setProjectEnv(project);
-    return {
-      state: store.readProjectState(project),
-      decisions: store.readDecisions(project),
-      dir: store.projectDir(project),
+  /** Finder picker for a .blend, used by Merge (destination) and Link. */
+  ipcMain.handle('dialog:pick-blend', async () => {
+    const { dialog, BrowserWindow } = await import('electron');
+    const win = BrowserWindow.getFocusedWindow();
+    const opts = {
+      title: 'Choose Blender file',
+      properties: ['openFile' as const],
+      filters: [{ name: 'Blender', extensions: ['blend'] }],
     };
+    const result = win
+      ? await dialog.showOpenDialog(win, opts)
+      : await dialog.showOpenDialog(opts);
+    if (result.canceled || !result.filePaths[0]) return { canceled: true as const };
+    return { canceled: false as const, blendPath: result.filePaths[0] };
+  });
+
+  /** Deterministic markdown export of a session's feed (+ note when present). */
+  ipcMain.handle('session:export', async (_e, sessionId: string) => {
+    await ensureMods();
+    const dir = store.sessionDirById(sessionId);
+    if (!fs.existsSync(dir)) return { ok: false, error: `session not found: ${sessionId}` };
+
+    const info = store.readSessionInfo(dir);
+    const link = store.readLink(dir);
+    const blendName = link?.blendId
+      ? store.readBlendMeta(link.blendId)?.name || path.basename(link.blendPath || '')
+      : undefined;
+    const title = info?.title?.trim() || sessionId;
+
+    const events = combinedDigest(dir, sessionId).filter(
+      (r) => r.kind === 'event' && typeof r.summary === 'string'
+    ) as Array<
+      DigestRow & {
+        summary: string;
+        type?: string;
+        tool?: string;
+        error?: { message: string; resolved?: boolean };
+      }
+    >;
+
+    const lines: string[] = [`# ${title}`, ''];
+    lines.push(`- Session: \`${sessionId}\``);
+    if (blendName) lines.push(`- Project: ${blendName}`);
+    if (info?.startedAt) lines.push(`- Started: ${info.startedAt}`);
+    if (info?.endedAt) lines.push(`- Ended: ${info.endedAt}`);
+    lines.push('', '## Activity', '');
+    if (events.length === 0) {
+      lines.push('_no recorded activity_');
+    }
+    for (const ev of events) {
+      const t = typeof ev.ts === 'string' ? ev.ts : '';
+      lines.push(`- ${t ? `\`${t}\` ` : ''}${ev.summary}${ev.type === 'error' ? ' **(error)**' : ''}`);
+      if (ev.error?.message) {
+        lines.push(`  - error: \`${ev.error.message}\`${ev.error.resolved ? ' (resolved)' : ''}`);
+      }
+      for (const a of ev.artifacts ?? []) {
+        lines.push(`  - artifact: ${a}`);
+      }
+    }
+    const note = store.notePath(dir);
+    if (fs.existsSync(note)) {
+      const text = fs.readFileSync(note, 'utf8').trim();
+      if (text) lines.push('', '## Session note', '', text);
+    }
+    const markdown = lines.join('\n') + '\n';
+
+    const { dialog, BrowserWindow } = await import('electron');
+    const win = BrowserWindow.getFocusedWindow();
+    const safe = title.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || sessionId;
+    const opts = {
+      title: 'Export session',
+      defaultPath: `${safe}.md`,
+      filters: [{ name: 'Markdown', extensions: ['md'] }],
+    };
+    const result = win
+      ? await dialog.showSaveDialog(win, opts)
+      : await dialog.showSaveDialog(opts);
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+    fs.writeFileSync(result.filePath, markdown, 'utf8');
+    return { ok: true, outPath: result.filePath };
   });
 
   ipcMain.handle('reveal', async (_e, targetPath: string) => {
@@ -268,6 +452,7 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
 
   ipcMain.handle('install:wrap', async (_e, serverName: string) => {
     await ensureMods();
+    bindHomeEnv();
     applyRuntimeEnv();
     return install.wrapServers([serverName]);
   });
@@ -280,6 +465,7 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
 
   ipcMain.handle('install:repair-store', async () => {
     await ensureMods();
+    bindHomeEnv();
     applyRuntimeEnv();
     return install.repairStoreHomes();
   });
@@ -295,7 +481,7 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
     applyRuntimeEnv();
     const { loadEnv } = await loadDist<{ loadEnv: () => void }>('lib/nvidia.js');
     loadEnv();
-    const home = store.flightrecHome();
+    const home = store.horatioHome();
     const envFile = path.join(home, '.env');
     let fromFile = false;
     if (fs.existsSync(envFile)) {
@@ -308,7 +494,7 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
 
   ipcMain.handle('apikey:set', async (_e, key: string) => {
     await ensureMods();
-    const home = store.ensureFlightrecHome();
+    const home = store.ensureV2Home();
     const envFile = path.join(home, '.env');
     let existing = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
     const line = `NVIDIA_API_KEY=${key.trim()}`;
@@ -330,7 +516,7 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
 
   ipcMain.handle('apikey:clear', async () => {
     await ensureMods();
-    const home = store.flightrecHome();
+    const home = store.horatioHome();
     const envFile = path.join(home, '.env');
     if (fs.existsSync(envFile)) {
       let existing = fs.readFileSync(envFile, 'utf8');
@@ -347,218 +533,59 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
     return { set: false, envPath: envFile };
   });
 
-  ipcMain.handle('distill:save', async (_e, sessionRef: string, project: string) => {
-    await ensureMods();
-    setProjectEnv(project);
-    process.env.FLIGHTREC_HOME = store.flightrecHome();
-    applyRuntimeEnv();
-
-    const session =
-      !sessionRef || sessionRef === 'latest'
-        ? store.latestSession(project)
-        : store.resolveSession(sessionRef, project);
-    if (!session) {
-      return { ok: false, output: 'No sessions for this Blender file yet' };
-    }
-
-    try {
-      // Same in-process path as export — avoids Electron spawn/PATH hangs.
-      const { loadEnv, setElectronFetch, resetClient } = await loadDist<{
-        loadEnv: () => void;
-        setElectronFetch: (f: typeof fetch) => void;
-        resetClient: () => void;
-      }>('lib/nvidia.js');
-      try {
-        const { net } = await import('electron');
-        const eNet = (net as unknown as { default?: typeof net }).default ?? net;
-        if (eNet?.fetch) setElectronFetch(eNet.fetch.bind(eNet) as typeof fetch);
-      } catch {
-        /* ignore */
-      }
-      loadEnv();
-      resetClient();
-      const { ensureDistilled, synthesizeSession } = await loadDist<{
-        ensureDistilled: (dir: string) => Promise<void>;
-        synthesizeSession: (dir: string) => Promise<unknown>;
-      }>('distill/tier2.js');
-
-      await ensureDistilled(session.dir);
-      await synthesizeSession(session.dir);
-      return { ok: true, output: `Saved ${session.id}` };
-    } catch (err) {
-      const output = err instanceof Error ? err.message : String(err);
-      console.error('[flightrec distill:save]', output);
-      return { ok: false, output };
-    }
-  });
-
-  // Keep wipe+re-derive available for power users / debugging.
-  ipcMain.handle('distill:replay', async (_e, sessionRef: string, project: string) => {
-    await ensureMods();
-    setProjectEnv(project);
-    process.env.FLIGHTREC_HOME = store.flightrecHome();
-    applyRuntimeEnv();
-    const ref =
-      !sessionRef || sessionRef === 'latest'
-        ? store.latestSession(project)?.id
-        : sessionRef;
-    if (!ref) {
-      return { ok: false, output: 'No sessions for this Blender file yet' };
-    }
-    const cli = path.join(runtimeRoot(), 'distill', 'cli.js');
-    const nodeBin = resolveNodeExecutable();
-    const env = {
-      ...process.env,
-      PATH: `/usr/local/bin:/opt/homebrew/bin:${process.env.PATH ?? '/usr/bin:/bin'}`,
-    };
-    delete env.ELECTRON_RUN_AS_NODE;
-    return new Promise<{ ok: boolean; output: string }>((resolve) => {
-      const child = spawn(nodeBin, [cli, 'distill', '--replay', ref], {
-        cwd: runtimeRoot(),
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let output = '';
-      child.stdout?.on('data', (d) => {
-        output += d.toString();
-      });
-      child.stderr?.on('data', (d) => {
-        output += d.toString();
-      });
-      child.on('close', (code) => {
-        resolve({ ok: code === 0, output });
-      });
-      child.on('error', (err) => {
-        resolve({ ok: false, output: String(err) });
-      });
-    });
-  });
-
-  ipcMain.handle(
-    'export:agent-memory',
-    async (
-      _e,
-      sessionDir: string,
-      project: string,
-      opts: { assemble?: boolean; saveAs?: boolean } = {}
-    ) => {
-      await ensureMods();
-      setProjectEnv(project);
-      process.env.FLIGHTREC_HOME = store.flightrecHome();
-      // Load app-data / repo .env so NVIDIA_API_KEY is available for Nemotron.
-      const { loadEnv } = await loadDist<{ loadEnv: () => void }>('lib/nvidia.js');
-      loadEnv();
-
-      const { exportAgentMemory } = await loadDist<{
-        exportAgentMemory: (
-          dir: string,
-          o?: { outPath?: string; assemble?: boolean }
-        ) => Promise<{
-          markdown: string;
-          sessionPath: string;
-          projectPath?: string;
-          outPath?: string;
-        }>;
-      }>('distill/agent-memory.js');
-
-      let outPath: string | undefined;
-      if (opts.saveAs) {
-        const { dialog, BrowserWindow } = await import('electron');
-        const win = BrowserWindow.getFocusedWindow();
-        const result = await dialog.showSaveDialog(win ?? undefined, {
-          title: 'Save agent memory',
-          defaultPath: 'flightrec-memory.md',
-          filters: [{ name: 'Markdown', extensions: ['md'] }],
-        });
-        if (result.canceled || !result.filePath) {
-          return { ok: false, canceled: true };
-        }
-        outPath = result.filePath;
-      }
-
-      try {
-        const exported = await exportAgentMemory(sessionDir, {
-          outPath,
-          assemble: opts.assemble,
-        });
-        return {
-          ok: true,
-          canceled: false,
-          sessionPath: exported.sessionPath,
-          projectPath: exported.projectPath,
-          outPath: exported.outPath,
-          markdown: exported.markdown,
-        };
-      } catch (err) {
-        return { ok: false, canceled: false, error: String(err) };
-      }
-    }
-  );
-
   ipcMain.handle('migrate:scan', async () => {
     await ensureMods();
-    const home = store.flightrecHome();
-    const projectsDir = path.join(home, 'projects');
-    const hasData =
-      fs.existsSync(projectsDir) &&
-      fs.readdirSync(projectsDir).some((n) => {
-        const sessions = path.join(projectsDir, n, 'sessions');
-        return fs.existsSync(sessions) && fs.readdirSync(sessions).length > 0;
-      });
-
+    const home = store.horatioHome();
+    const state = store.storeState(home);
+    const legacy = store.legacyAppDataHome();
     const sources: Array<{ kind: string; path: string; label: string }> = [];
-    if (!isPackaged()) {
-      const repoLocal = path.join(REPO_ROOT, '.flightrec');
-      if (
-        fs.existsSync(path.join(repoLocal, 'sessions')) ||
-        fs.existsSync(path.join(repoLocal, 'project-state.md'))
-      ) {
-        sources.push({ kind: 'project-local', path: repoLocal, label: 'Repo .flightrec' });
-      }
+
+    if (state === 'v1') {
+      sources.push({ kind: 'v1-home', path: home, label: `v1 store at ${home}` });
     }
-    const legacy = path.join(os.homedir(), '.flightrec', 'projects');
-    if (fs.existsSync(legacy)) {
-      for (const name of fs.readdirSync(legacy)) {
-        const p = path.join(legacy, name);
-        if (fs.statSync(p).isDirectory()) {
+    if (
+      path.resolve(legacy) !== path.resolve(home) &&
+      fs.existsSync(legacy) &&
+      !fs.existsSync(path.join(legacy, 'MOVED-TO-HORATIO.txt'))
+    ) {
+      sources.push({
+        kind: 'legacy',
+        path: legacy,
+        label: `Legacy flightrec store (${legacy})`,
+      });
+    }
+    if (!isPackaged()) {
+      for (const name of ['.horatio', '.flightrec']) {
+        const repoLocal = path.join(REPO_ROOT, name);
+        if (
+          fs.existsSync(path.join(repoLocal, 'sessions')) ||
+          fs.existsSync(path.join(repoLocal, 'projects')) ||
+          fs.existsSync(path.join(repoLocal, 'project-state.md'))
+        ) {
           sources.push({
-            kind: 'legacy',
-            path: p,
-            label: `Legacy ~/.flightrec/projects/${name}`,
+            kind: 'project-local',
+            path: repoLocal,
+            label: `Repo ${name}`,
           });
         }
       }
     }
+    const hasData = sources.length > 0;
     return { hasData, home, sources };
   });
 
-  ipcMain.handle('migrate:import', async (_e, sourcePath: string, destProject: string) => {
+  ipcMain.handle('migrate:import', async (_e, _sourcePath: string, _destProject: string) => {
     await ensureMods();
-    const dest = store.projectDir(destProject);
-    fs.mkdirSync(path.join(dest, 'sessions'), { recursive: true });
-
-    const srcSessions = path.join(sourcePath, 'sessions');
-    const srcState = path.join(sourcePath, 'project-state.md');
-    const srcDecisions = path.join(sourcePath, 'decisions.jsonl');
-
-    let importedSessions = 0;
-    if (fs.existsSync(srcSessions)) {
-      for (const name of fs.readdirSync(srcSessions)) {
-        const from = path.join(srcSessions, name);
-        const to = path.join(dest, 'sessions', name);
-        if (!fs.statSync(from).isDirectory()) continue;
-        if (fs.existsSync(to)) continue;
-        fs.cpSync(from, to, { recursive: true });
-        importedSessions++;
-      }
-    }
-    if (fs.existsSync(srcState) && !fs.existsSync(path.join(dest, 'project-state.md'))) {
-      fs.copyFileSync(srcState, path.join(dest, 'project-state.md'));
-    }
-    if (fs.existsSync(srcDecisions) && !fs.existsSync(path.join(dest, 'decisions.jsonl'))) {
-      fs.copyFileSync(srcDecisions, path.join(dest, 'decisions.jsonl'));
-    }
-    return { importedSessions, dest };
+    bindHomeEnv();
+    const { migrateStore } = await loadDist<{
+      migrateStore: (opts?: { dryRun?: boolean }) => {
+        sessionsMigrated: number;
+        target: string;
+        actions: string[];
+      };
+    }>('lib/migrate.js');
+    const report = migrateStore();
+    return { importedSessions: report.sessionsMigrated, dest: report.target };
   });
 
   ipcMain.handle('watch:start', async (event, watchPath: string) => {

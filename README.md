@@ -1,17 +1,18 @@
-# flightrec
+# Horatio
 
-A flight recorder for MCP-driven Blender work. flightrec sits transparently between your MCP client (Claude Desktop / Claude Code / Cursor) and [blender-mcp](https://github.com/ahujasid/blender-mcp), records every message, distills the traffic with **NVIDIA Nemotron** into persistent project memory, and serves that memory back to agents over MCP — so every future session warm-starts instead of cold-starts.
+A flight recorder for MCP-driven Blender work. Horatio sits transparently between your MCP client (Claude Desktop / Claude Code / Cursor) and [blender-mcp](https://github.com/ahujasid/blender-mcp), records every message, distills the traffic with **NVIDIA Nemotron** into persistent per-file memory, and serves that memory back to agents over MCP — so every future session warm-starts instead of cold-starts.
 
 ```
 Claude ──stdio──> tap ──stdio──> uvx blender-mcp ──tcp──> Blender
                    │
                    └──append──> raw.jsonl ──tail── distiller (Nemotron)
-                                                      ├── digest.jsonl   (Tier 1: incremental)
-                                                      └── note.md + project-state.md (Tier 2)
-Claude ──stdio──> memory-server ──reads──> project-state.md + notes
+                                                      ├── digest.jsonl   (activity, live)
+                                                      └── note.md + blends/<id>/memory.md
+Claude ──stdio──> memory-server ──reads──> file memory + notes
+                                           (recall / search_sessions / log_decision)
 ```
 
-**Core invariant:** `raw.jsonl` is the source of truth. Everything downstream is re-derivable (`flightrec distill --replay`).
+**Core invariant:** `raw.jsonl` is the source of truth. Everything downstream is re-derivable (`horatio rebuild`). The only other source of truth is `decisions.jsonl` (agent-authored via `log_decision`).
 
 **Deeper docs:** [architecture & data flow](docs/architecture.md) · [desktop app internals](docs/desktop.md) · [why Nemotron](docs/why-nemotron.md) · [contributor guide (CLAUDE.md)](CLAUDE.md).
 
@@ -31,7 +32,7 @@ Build a downloadable macOS app (unsigned `.dmg` — right-click → Open the fir
 
 ```bash
 npm install && npm run desktop:install
-npm run desktop:dist          # → desktop/release/flightrec-*.dmg
+npm run desktop:dist          # → desktop/release/*.dmg
 ```
 
 Or run from the repo (use a normal terminal, not an environment that sets `ELECTRON_RUN_AS_NODE`):
@@ -43,7 +44,7 @@ npm run desktop               # build + Electron hot reload
 cd desktop && npm start       # production build of the UI, no Vite
 ```
 
-**Projects are Blender files**, not arbitrary names. New sessions land under **Unsaved** until a `.blend` path shows up in MCP traffic (e.g. `bpy.data.filepath`) or you click **Link .blend…**. Memory then hangs off that file; **Reveal** / **Open** jump to it on disk.
+**Projects are Blender files**, not arbitrary names. Sessions live in a flat `sessions/` tree and are **linked** (never moved) to a `blends/<id>/` bucket when a `.blend` path shows up in MCP traffic or you click **Link .blend…**. Memory hangs off that file; **Reveal** / **Open** jump to it on disk.
 
 ### CLI
 
@@ -55,7 +56,9 @@ node dist/distill/cli.js install --wrap blender
 node dist/distill/cli.js uninstall
 ```
 
-`install --wrap` sets `FLIGHTREC_HOME` to the platform app-data folder (`~/Library/Application Support/flightrec` on macOS). Optional `--project-dir <path>` overrides to `<path>/.flightrec`. **Restart the MCP client** after install so wraps pick up the new home.
+`install --wrap` sets `HORATIO_HOME` to the platform app-data folder (`~/Library/Application Support/Horatio` on macOS). Optional `--project-dir <path>` overrides to `<path>/.horatio`. **Restart the MCP client** after install so wraps pick up the new home.
+
+Legacy `FLIGHTREC_*` env vars still resolve (with a deprecation warning). Older flightrec stores need a one-time `horatio migrate`.
 
 `install` finds Claude Code, Claude Desktop, and Cursor configs automatically, wraps the named server with the tap, and registers the memory server alongside. Claude Code uses the official `claude mcp` CLI; Desktop and Cursor get surgical JSON edits with a timestamped backup and atomic writes. Wrapped entries are self-describing, so `uninstall` restores the originals without a state file. Use `--client <claude-code|claude-desktop|cursor>` to target one client, or `--config <path>` for any config with the standard `mcpServers` shape.
 
@@ -67,16 +70,16 @@ node dist/distill/cli.js uninstall
   "mcpServers": {
     "blender": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/flightrec/dist/tap.js", "--", "uvx", "blender-mcp"],
+      "args": ["/ABSOLUTE/PATH/Horatio/dist/tap.js", "--", "uvx", "blender-mcp"],
       "env": {
-        "FLIGHTREC_HOME": "/Users/you/Library/Application Support/flightrec"
+        "HORATIO_HOME": "/Users/you/Library/Application Support/Horatio"
       }
     },
-    "flightrec-memory": {
+    "horatio-memory": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/flightrec/dist/memory-server.js"],
+      "args": ["/ABSOLUTE/PATH/Horatio/dist/memory-server.js"],
       "env": {
-        "FLIGHTREC_HOME": "/Users/you/Library/Application Support/flightrec"
+        "HORATIO_HOME": "/Users/you/Library/Application Support/Horatio"
       }
     }
   }
@@ -84,62 +87,66 @@ node dist/distill/cli.js uninstall
 ```
 </details>
 
-The tap auto-spawns the distiller per session (opt out with `FLIGHTREC_NO_AUTODISTILL=1` and run `node dist/distill/cli.js distill --follow latest` in a terminal instead — nicer for demos).
+The tap auto-spawns the activity follower per session (opt out with `HORATIO_NO_ACTIVITY=1` / legacy `FLIGHTREC_NO_AUTODISTILL=1` and run `node dist/distill/cli.js watch latest` in a terminal instead — nicer for demos).
 
 ## Commands
 
 ```bash
-node dist/distill/cli.js distill --follow [session]   # Tier 1 only — live digests
-node dist/distill/cli.js distill --save [session]     # Tier 2 — note.md + project-state.md
-node dist/distill/cli.js distill --replay [session]   # wipe digests, re-run Tier 1 + Tier 2
-node dist/distill/cli.js export-memory [session] [--out path]   # portable agent .md
+node dist/distill/cli.js watch [session]              # live activity → digests; auto-update memory at session end
+node dist/distill/cli.js update [session]             # session note.md + fold into blends/<id>/memory.md
+node dist/distill/cli.js rebuild [session]            # wipe digests, re-derive activity, then update memory
+node dist/distill/cli.js export-memory [session] [--out path] [--assemble]
+node dist/distill/cli.js migrate [--dry-run]          # one-time flightrec (v1) → Horatio (v2) store
 npm run desktop                                       # viewer + control plane
 ```
 
-Tier 2 is **manual**: click **Save state** in the desktop app (or `distill --save`). Live capture only runs Tier 1. `recall()` returns existing notes/state; it does not synthesize on demand.
+Legacy aliases: `distill --follow` → `watch`, `--save` → `update`, `--replay` → `rebuild`.
 
-`export-memory` writes `agent-memory.md` into the session folder (and optionally `--out` to your coding-agent project). It uses Nemotron to produce an agent-oriented brief from the session note + project state; pass `--assemble` to skip the LLM and concatenate mechanically. Requires a prior Save state (or `--assemble` without a note).
+`update` / “Update memory” in the app folds digests into durable file memory. Live capture mainly writes activity (Tier 1); synthesis runs at session end, on idle, or when you update manually. `recall()` returns existing notes/memory — it does not synthesize on demand.
+
+`export-memory` writes `agent-memory.md` into the session folder (and optionally `--out` to your coding-agent project). It uses Nemotron to produce an agent-oriented brief from the session note + file memory; pass `--assemble` to skip the LLM and concatenate mechanically.
 
 `session` = `latest` (default), a session id, or a path.
 
 ## Store layout
 
-Canonical app-owned store (default):
+Canonical app-owned store (default, v2):
 
 ```
-~/Library/Application Support/flightrec/   # macOS
-~/.config/flightrec/                       # Linux
-%APPDATA%/flightrec/                       # Windows
-  config.json
-  .env                                     # NVIDIA_API_KEY (optional; also loads repo .env)
-  projects/_unsaved/                       # sessions before a .blend is known
-  projects/<basename>-<hash8>/             # one folder per Blender file
-    meta.json                              # { blendPath, name, … }
-    project-state.md
+~/Library/Application Support/Horatio/   # macOS
+~/.config/horatio/                       # Linux
+%APPDATA%/Horatio/                       # Windows
+  config.json                            # storeVersion: 2
+  .env                                   # NVIDIA_API_KEY (optional; also loads repo .env)
+  live/<session-id>.json                 # per-tap live pointers
+  sessions/<ISO-id>/                     # flat — sessions never move
+    raw.jsonl  digest.jsonl  note.md  distill.log  artifacts/
+    session.json  link.json  memory.json
+    agent-memory.md                      # optional export
+  blends/<basename>-<hash8>/             # one folder per Blender file
+    meta.json                            # { blendPath, name, … }
+    memory.md                            # durable cross-session file memory
     decisions.jsonl
-    sessions/<ISO-timestamp>/
-      raw.jsonl  digest.jsonl  note.md  distill.log  artifacts/
-      session.json                         # { blendPath, projectId } once attached
-      agent-memory.md                      # optional export
+    memory-history/                      # recent memory.md archives
 ```
 
-Project-local override (`--project-dir` or `FLIGHTREC_HOME=<workspace>/.flightrec`):
+Project-local override (`--project-dir` or `HORATIO_HOME=<workspace>/.horatio`):
 
 ```
-<workspace>/.flightrec/
-  project-state.md  decisions.jsonl  sessions/...
+<workspace>/.horatio/
+  (same shape as above)
 ```
 
-If an older wrap still points at a repo `.flightrec`, use **Setup → Fix store paths** in the desktop app (or re-run `install --wrap`), then restart the client.
+If an older wrap still points at a repo `.flightrec` / flightrec app-data path, use **Preferences → Fix store paths** (or `install --repair-store` / `horatio migrate`), then restart the client.
 
 ## Memory tools (MCP)
 
-- **`recall`** — project state + latest session note (lazily synthesized if missing). Agents are told to call this first.
-- **`search_sessions(query)`** — substring search across notes, digest events, and project state, with session/batch citations. No embeddings; at 1M context, brute force is the architecture.
+- **`recall`** — judgment-first warm start for the active `.blend` (decisions / constraints / failures / threads first; scene inventory last and marked historical). Warns if the `.blend` file is newer than last memory update. Agents must re-check the live scene with Blender MCP. Resolves from optional `file` arg → live session link → most recently linked file.
+- **`search_sessions(query)`** — substring search across notes, digest events, and file memory, with session/batch citations. No embeddings; at 1M context, brute force is the architecture.
 - **`log_decision(text)`** — record a durable decision from the driving agent; memory is bidirectional.
 
 ## Guarantees
 
 - The tap is transparent: byte-for-byte forwarding, verified byte-identical against un-tapped runs; logging failures can never affect forwarding; base64 screenshots never reach the log.
 - No speculation in distilled memory: every digest event cites the raw-record seq numbers supporting it; error strings are verbatim; hallucinated causality is prompt-forbidden and schema-policed — bad memory poisons future sessions, so incomplete beats invented.
-- Batch boundaries are deterministic (record-timestamp gaps, not wall clock): `--replay` reproduces the same batches a live run made.
+- Batch boundaries are deterministic (record-timestamp gaps, not wall clock): `rebuild` reproduces the same batches a live run made.

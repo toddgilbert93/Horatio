@@ -31,13 +31,22 @@ Output: a JSON object {"events": [...]} and nothing else. Each event: {"type": "
 
 Every event requires "summary" and non-empty "src". Error details are NESTED under "error", e.g.:
 {"type": "error", "src": [12, 15], "summary": "execute failed with KeyError", "tool": "trigger_error", "error": {"message": "KeyError: 'Tree.001'", "resolved": false}}
-For the scene_delta event, "src" cites the records you inspected to conclude the delta — when nothing changed, cite the batch's records anyway.`;
+For the scene_delta event, "src" cites the records you inspected to conclude the delta — when nothing changed, cite the batch's records anyway.
 
-export function buildTier1User(batchId: string, records: RawRecord[]): string {
+When asked for a session title, also include a top-level "title" string: 3–6 words, concrete, naming the work (e.g. "Castle tower modeling"). No quotes, no punctuation fluff.`;
+
+export function buildTier1User(
+  batchId: string,
+  records: RawRecord[],
+  opts?: { wantTitle?: boolean }
+): string {
   const first = records[0]?.seq ?? 0;
   const last = records[records.length - 1]?.seq ?? 0;
   const lines = records.map(renderRecord).filter((l) => l !== '');
-  return `Batch ${batchId}, records seq ${first}-${last}:\n\n${lines.join('\n')}`;
+  const titleAsk = opts?.wantTitle
+    ? '\n\nAlso propose a short session title (3–6 words) as top-level JSON key "title".'
+    : '';
+  return `Batch ${batchId}, records seq ${first}-${last}:\n\n${lines.join('\n')}${titleAsk}`;
 }
 
 /** Payloads stay complete up to this size; beyond it, head+tail with a marker. */

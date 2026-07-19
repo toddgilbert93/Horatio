@@ -1,37 +1,51 @@
 {
-  "name": "flightrec-desktop",
+  "name": "horatio-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "flightrec viewer + control plane — capture, distill, and recall Blender MCP memory",
-  "author": "flightrec",
+  "description": "Horatio — flight recorder for MCP-driven Blender work",
+  "author": "Horatio",
   "main": "./out/main/index.cjs",
   "scripts": {
-    "dev": "env -u ELECTRON_RUN_AS_NODE electron-vite dev",
+    "brand": "node scripts/brand-electron.mjs",
+    "dev": "npm run brand && env -u ELECTRON_RUN_AS_NODE electron-vite dev",
     "build": "electron-vite build",
-    "preview": "env -u ELECTRON_RUN_AS_NODE electron-vite preview",
-    "start": "env -u ELECTRON_RUN_AS_NODE electron .",
+    "preview": "npm run brand && env -u ELECTRON_RUN_AS_NODE electron-vite preview",
+    "start": "npm run brand && env -u ELECTRON_RUN_AS_NODE electron .",
     "pack:runtime": "node ../scripts/pack-runtime.mjs",
     "dist": "npm run pack:runtime && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false env -u ELECTRON_RUN_AS_NODE electron-builder --mac",
     "dist:dir": "npm run pack:runtime && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false env -u ELECTRON_RUN_AS_NODE electron-builder --mac --dir"
   },
   "dependencies": {
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.6.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.25.0",
+    "radix-ui": "^1.6.2",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.6.0",
+    "three": "^0.185.1"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@types/three": "^0.185.1",
     "@vitejs/plugin-react": "^4.3.0",
     "electron": "^34.0.0",
     "electron-builder": "^25.1.8",
     "electron-vite": "^3.0.0",
+    "tailwindcss": "^4.3.3",
+    "tw-animate-css": "^1.4.0",
     "typescript": "^5.6.0",
     "vite": "^6.0.0"
   },
   "build": {
-    "appId": "dev.flightrec.app",
-    "productName": "flightrec",
-    "copyright": "Copyright © flightrec",
+    "appId": "dev.horatio.app",
+    "productName": "Horatio",
+    "copyright": "Copyright © Horatio",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -48,14 +62,17 @@
     ],
     "asar": true,
     "mac": {
+      "icon": "build/icon.icns",
       "category": "public.app-category.developer-tools",
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
       "identity": null
     },
     "dmg": {
-      "title": "flightrec"
+      "title": "Horatio"
     }
   }
 }

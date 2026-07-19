@@ -1,370 +1,260 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { SessionSummary } from '../../preload/index';
-import { Timeline } from './components/Timeline';
-import { MarkdownView } from './components/MarkdownView';
-import { Toast } from './components/Toast';
+import { Component, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ErrorInfo, type ReactNode } from 'react'
+import type { SessionListItem } from '../preload/index'
+import bustIcon from '@/assets/brand/bust-icon.png'
+import { Feed } from './components/Feed'
+import { SessionToolbar } from './components/SessionToolbar'
+import { sessionLabel } from '@/lib/session'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { showToast } from '@/lib/toast'
+
+const BustViewer = lazy(() =>
+  import('@/components/bust').then((m) => ({ default: m.BustViewer }))
+)
+
+const ALL_PROJECTS = '__all__'
 
 type ProjectInfo = {
-  id: string;
-  name: string;
-  blendPath: string;
-  sessionCount: number;
-  blendExists: boolean;
-  dir: string;
-};
+  id: string
+  name: string
+  blendPath: string
+  sessionCount: number
+  blendExists: boolean
+  dir: string
+}
 
-type Tab = 'timeline' | 'state' | 'note' | 'artifacts' | 'raw' | 'log';
+class BustErrorBoundary extends Component<
+  { children: ReactNode; fallback: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false }
+
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[horatio] BustViewer failed', error, info)
+  }
+
+  render() {
+    if (this.state.failed) return this.props.fallback
+    return this.props.children
+  }
+}
+
+function BustFallback() {
+  return (
+    <img
+      src={bustIcon}
+      alt=""
+      className="size-full object-cover"
+      draggable={false}
+    />
+  )
+}
+
+const selectTriggerClass =
+  'h-8 min-w-0 border-0 !bg-transparent px-2 shadow-none text-[13px] hover:!bg-transparent focus-visible:ring-0 focus-visible:border-transparent dark:!bg-transparent dark:hover:!bg-transparent'
 
 export default function App() {
-  const [projects, setProjects] = useState<ProjectInfo[]>([]);
-  const [project, setProject] = useState('_unsaved');
-  const projectRef = useRef(project);
-  projectRef.current = project;
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [selected, setSelected] = useState<SessionSummary | null>(null);
-  const selectedRef = useRef<SessionSummary | null>(null);
-  selectedRef.current = selected;
-  const [tab, setTab] = useState<Tab>('timeline');
-  const [note, setNote] = useState('');
-  const [digest, setDigest] = useState<unknown[]>([]);
-  const [raw, setRaw] = useState<unknown[]>([]);
-  const [log, setLog] = useState('');
-  const [artifacts, setArtifacts] = useState<Array<{ name: string; path: string; url: string }>>(
-    []
-  );
-  const [projectState, setProjectState] = useState('');
-  const [toast, setToast] = useState<{ msg: string; error?: boolean } | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [sessions, setSessions] = useState<SessionListItem[]>([])
+  const [projects, setProjects] = useState<ProjectInfo[]>([])
+  const [projectFilter, setProjectFilter] = useState(ALL_PROJECTS)
+  const projectFilterRef = useRef(projectFilter)
+  projectFilterRef.current = projectFilter
+  const [selected, setSelected] = useState<SessionListItem | null>(null)
+  const selectedRef = useRef<SessionListItem | null>(null)
+  selectedRef.current = selected
+  const [digest, setDigest] = useState<unknown[]>([])
 
-  const showToast = useCallback((msg: string, error = false, holdMs = 4000) => {
-    setToast({ msg, error });
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    if (holdMs > 0) {
-      toastTimer.current = setTimeout(() => setToast(null), holdMs);
-    }
-  }, []);
+  const filteredSessions = useMemo(() => {
+    if (projectFilter === ALL_PROJECTS) return sessions
+    if (projectFilter === '_unlinked') return sessions.filter((s) => !s.blendId)
+    return sessions.filter((s) => s.blendId === projectFilter)
+  }, [sessions, projectFilter])
 
-  const currentProject = projects.find((p) => p.id === project);
+  const loadSession = useCallback(async (s: SessionListItem) => {
+    setSelected(s)
+    selectedRef.current = s
+    const d = await window.flightrec.getDigest(s.dir)
+    setDigest(d)
+  }, [])
 
-  const loadSession = useCallback(async (s: SessionSummary) => {
-    setSelected(s);
-    selectedRef.current = s;
-    const [n, d, r, l, a] = await Promise.all([
-      window.flightrec.getNote(s.dir),
-      window.flightrec.getDigest(s.dir),
-      window.flightrec.getRaw(s.dir, 400),
-      window.flightrec.getDistillLog(s.dir),
-      window.flightrec.getArtifacts(s.dir),
-    ]);
-    setNote(n);
-    setDigest(d);
-    setRaw(r);
-    setLog(l);
-    setArtifacts(a);
-  }, []);
-
-  const refreshSessions = useCallback(
-    async (proj: string, preferId?: string | null) => {
-      const list = await window.flightrec.listSessions(proj);
-      setSessions(list);
-      const keepId = preferId ?? selectedRef.current?.id;
-      const next = (keepId && list.find((s) => s.id === keepId)) || list[0] || null;
-      if (next) await loadSession(next);
+  const pickSession = useCallback(
+    async (list: SessionListItem[], preferId?: string | null) => {
+      const keepId = preferId ?? selectedRef.current?.id
+      const next = (keepId && list.find((s) => s.id === keepId)) || list[0] || null
+      if (next) await loadSession(next)
       else {
-        setSelected(null);
-        selectedRef.current = null;
-        setNote('');
-        setDigest([]);
-        setRaw([]);
-        setLog('');
-        setArtifacts([]);
+        setSelected(null)
+        selectedRef.current = null
+        setDigest([])
       }
-      return list;
     },
     [loadSession]
-  );
+  )
 
-  const loadProject = useCallback(
-    async (proj: string, preferSessionId?: string | null) => {
-      await refreshSessions(proj, preferSessionId);
-      const st = await window.flightrec.getProjectState(proj);
-      setProjectState(st.state);
+  const refresh = useCallback(
+    async (preferId?: string | null) => {
+      const [list, projs] = await Promise.all([
+        window.flightrec.listAllSessions(),
+        window.flightrec.listProjects(),
+      ])
+      setSessions(list)
+      setProjects(projs)
+
+      const filter = projectFilterRef.current
+      const visible =
+        filter === ALL_PROJECTS
+          ? list
+          : filter === '_unlinked'
+            ? list.filter((s) => !s.blendId)
+            : list.filter((s) => s.blendId === filter)
+      await pickSession(visible, preferId)
     },
-    [refreshSessions]
-  );
-
-  const bootstrap = useCallback(async () => {
-    try {
-      await window.flightrec.ensureHome();
-      const h = await window.flightrec.getHome();
-      const cfg = await window.flightrec.getConfig();
-      const projs = await window.flightrec.listProjects();
-      setProjects(projs);
-      const ids = projs.map((p) => p.id);
-      const proj =
-        typeof cfg.lastProject === 'string' && ids.includes(cfg.lastProject)
-          ? cfg.lastProject
-          : (projs.find((p) => p.id !== '_unsaved')?.id ?? projs[0]?.id ?? '_unsaved');
-      setProject(proj);
-      projectRef.current = proj;
-      await loadProject(proj);
-      await window.flightrec.watchStart(h.home);
-    } catch (err) {
-      showToast(String(err), true);
-    }
-  }, [loadProject, showToast]);
+    [pickSession]
+  )
 
   useEffect(() => {
-    void bootstrap();
-    const unsub = window.flightrec.onWatchChanged(() => {
-      void (async () => {
-        const projs = await window.flightrec.listProjects();
-        setProjects(projs);
-        await loadProject(projectRef.current, selectedRef.current?.id);
-      })();
-    });
-    return () => {
-      unsub();
-      void window.flightrec.watchStop();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function selectProject(name: string) {
-    setProject(name);
-    projectRef.current = name;
-    await window.flightrec.setConfig({ lastProject: name });
-    setSelected(null);
-    selectedRef.current = null;
-    await loadProject(name);
-  }
-
-  async function selectSession(id: string) {
-    const s = sessions.find((x) => x.id === id);
-    if (s) await loadSession(s);
-  }
-
-  async function handleUpdateMemory() {
-    if (!selected) return;
-    showToast('Updating project memory…', false, 0);
-    try {
-      const result = await window.flightrec.distillSave(selected.id, project);
-      if (result.ok) {
-        showToast('Project memory updated');
-      } else {
-        const detail = (result.output || '').trim().slice(0, 180);
-        showToast(detail ? `Update failed: ${detail}` : 'Update failed', true, 8000);
+    void (async () => {
+      try {
+        await window.flightrec.ensureHome()
+        const h = await window.flightrec.getHome()
+        await refresh()
+        await window.flightrec.watchStart(h.home)
+      } catch (err) {
+        showToast(String(err), true)
       }
-      await loadProject(project, selected.id);
-    } catch (err) {
-      showToast(String(err), true, 8000);
+    })()
+    const unsub = window.flightrec.onWatchChanged(() => {
+      void refresh(selectedRef.current?.id)
+    })
+    return () => {
+      unsub()
+      void window.flightrec.watchStop()
     }
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-  async function handleExportMemory(saveAs: boolean) {
-    if (!selected) {
-      showToast('No session selected', true);
-      return;
-    }
-    showToast(saveAs ? 'Exporting agent memory…' : 'Generating agent memory…');
-    const result = await window.flightrec.exportAgentMemory(selected.dir, project, {
-      saveAs,
-    });
-    if (result.canceled) {
-      showToast('Export canceled');
-      return;
-    }
-    if (!result.ok) {
-      showToast(result.error ?? 'Export failed', true);
-      return;
-    }
-    if (result.outPath) {
-      showToast(`Saved → ${result.outPath}`);
-      await window.flightrec.reveal(result.outPath);
-    } else if (result.projectPath) {
-      showToast(`Wrote ${result.projectPath}`);
-    } else if (result.sessionPath) {
-      showToast(`Wrote ${result.sessionPath}`);
-    }
-    await loadSession(selected);
+  async function selectProjectFilter(id: string) {
+    setProjectFilter(id)
+    projectFilterRef.current = id
+    const visible =
+      id === ALL_PROJECTS
+        ? sessions
+        : id === '_unlinked'
+          ? sessions.filter((s) => !s.blendId)
+          : sessions.filter((s) => s.blendId === id)
+    await pickSession(visible, selectedRef.current?.id)
   }
 
   return (
-    <div className="app">
-      <main className="main">
-        <div className="toolbar">
-          <div className="toolbar-pickers">
-            <label className="picker">
-              <span className="picker-label">File</span>
-              <select
-                value={project}
-                onChange={(e) => void selectProject(e.target.value)}
-                title={currentProject?.blendPath || currentProject?.name || project}
-              >
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                    {p.blendPath ? '' : ' (unlinked)'}
-                    {p.sessionCount ? ` · ${p.sessionCount}` : ''}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="picker">
-              <span className="picker-label">Session</span>
-              <select
-                value={selected?.id ?? ''}
-                onChange={(e) => void selectSession(e.target.value)}
-                disabled={sessions.length === 0}
-              >
-                {sessions.length === 0 ? (
-                  <option value="">No sessions</option>
-                ) : (
-                  sessions.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.id}
-                      {s.hasNote ? ' · note' : ''}
-                      {s.artifactCount ? ` · ${s.artifactCount} shots` : ''}
-                    </option>
-                  ))
-                )}
-              </select>
-            </label>
-          </div>
-          <button
-            className="primary"
-            disabled={!selected}
-            onClick={() => void handleUpdateMemory()}
+    <div
+      className="flex h-full flex-col"
+      style={
+        {
+          backgroundColor: '#041300',
+          // Keep design tokens from painting lighter washes over the ink ground.
+          ['--background' as string]: '#041300',
+          ['--card' as string]: '#041300',
+          ['--muted' as string]: '#041300',
+          // Elevated fill so secondary toolbar buttons read against the ink ground.
+          ['--secondary' as string]: '#30372e',
+          ['--sidebar' as string]: '#041300',
+          ['--input' as string]: 'transparent',
+        } as CSSProperties
+      }
+    >
+      <header
+        className="flex items-center justify-end gap-2 py-2 pr-4 pl-[72px]"
+        style={{ WebkitAppRegion: 'drag', backgroundColor: '#041300' } as CSSProperties}
+      >
+        <Select
+          value={selected?.id}
+          onValueChange={(id) => {
+            const s = filteredSessions.find((x) => x.id === id)
+            if (s) void loadSession(s)
+          }}
+          disabled={filteredSessions.length === 0}
+        >
+          <SelectTrigger
+            className={`${selectTriggerClass} w-[200px] max-w-[200px] min-w-0 shrink-0 overflow-hidden`}
+            style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
           >
-            Update project memory
-          </button>
-          <button disabled={!selected} onClick={() => void handleExportMemory(true)}>
-            Export agent memory…
-          </button>
+            <SelectValue placeholder="No sessions yet" />
+          </SelectTrigger>
+          <SelectContent>
+            {filteredSessions.map((s) => (
+              <SelectItem key={s.id} value={s.id} className="text-[13px]">
+                {sessionLabel(s)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        <Select value={projectFilter} onValueChange={(v) => void selectProjectFilter(v)}>
+          <SelectTrigger
+            className={`${selectTriggerClass} w-[120px] shrink-0 text-muted-foreground`}
+            style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
+          >
+            <SelectValue placeholder="All projects" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL_PROJECTS} className="text-[13px]">
+              All projects
+            </SelectItem>
+            {projects.map((p) => (
+              <SelectItem key={p.id} value={p.id} className="text-[13px]">
+                {p.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </header>
+
+      <div className="flex min-h-0 flex-1" style={{ backgroundColor: '#041300' }}>
+        <div
+          className="flex w-[200px] shrink-0 items-center justify-center p-2"
+          style={{ backgroundColor: '#041300' }}
+        >
+          <div className="size-[180px] overflow-hidden" style={{ backgroundColor: '#041300' }}>
+            <BustErrorBoundary fallback={<BustFallback />}>
+              <Suspense fallback={<BustFallback />}>
+                <BustViewer rotating materialId="bone" style={{ maxWidth: 180, maxHeight: 180 }} />
+              </Suspense>
+            </BustErrorBoundary>
+          </div>
         </div>
 
-        {!selected ? (
-          <div className="content">
-            <div className="empty">
-              <h3>No sessions yet</h3>
-              <p>
-                Wrap blender under Preferences (⌘,), then run a Blender MCP session. Sessions will
-                appear in the Session menu above.
+        <div className="min-w-0 flex-1 py-3 pr-4 pl-1" style={{ backgroundColor: '#041300' }}>
+          {selected ? (
+            <Feed
+              records={digest}
+              sessionDir={selected.dir}
+              emptyHint="Session started — activity will appear here."
+            />
+          ) : (
+            <div className="flex h-full items-center">
+              <p className="text-[13px] leading-relaxed text-muted-foreground">
+                Wrap blender under Preferences (⌘,), then run a Blender MCP session.
               </p>
             </div>
-          </div>
-        ) : (
-          <>
-            <div className="tabs">
-              {(
-                [
-                  ['timeline', 'Timeline'],
-                  ['state', 'State'],
-                  ['note', 'Note'],
-                  ['artifacts', 'Artifacts'],
-                  ['raw', 'Raw'],
-                  ['log', 'Distill log'],
-                ] as const
-              ).map(([id, label]) => (
-                <button
-                  key={id}
-                  className={tab === id ? 'active' : ''}
-                  onClick={() => {
-                    setTab(id);
-                    if (id === 'state') {
-                      void window.flightrec.getProjectState(project).then((st) => {
-                        setProjectState(st.state);
-                      });
-                    }
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <div className="content">
-              {tab === 'timeline' && <Timeline records={digest} />}
-              {tab === 'note' &&
-                (note ? (
-                  <MarkdownView text={note} />
-                ) : (
-                  <div className="empty">
-                    <h3>No note.md yet</h3>
-                    <p>
-                      Click Update project memory to run Tier 2 and write this session&apos;s note +
-                      shared project state.
-                    </p>
-                  </div>
-                ))}
-              {tab === 'state' &&
-                (projectState.trim() ? (
-                  <MarkdownView text={projectState} />
-                ) : (
-                  <div className="empty">
-                    <h3>No project state yet</h3>
-                    <p>
-                      Shared across sessions for this Blender file. Update project memory after a
-                      session (or use log_decision) to fill it in.
-                    </p>
-                  </div>
-                ))}
-              {tab === 'artifacts' &&
-                (artifacts.length === 0 ? (
-                  <div className="empty">
-                    <h3>No screenshots</h3>
-                    <p>Viewport screenshots from get_viewport_screenshot land here.</p>
-                  </div>
-                ) : (
-                  <div className="gallery">
-                    {artifacts.map((a) => (
-                      <figure key={a.path}>
-                        <img src={a.url} alt={a.name} />
-                        <figcaption>{a.name}</figcaption>
-                      </figure>
-                    ))}
-                  </div>
-                ))}
-              {tab === 'raw' &&
-                (raw.length === 0 ? (
-                  <div className="empty">
-                    <h3>No raw records</h3>
-                  </div>
-                ) : (
-                  <div className="raw-list">
-                    {raw.map((row, i) => {
-                      const r = row as {
-                        seq?: number;
-                        dir?: string;
-                        tool?: string;
-                        status?: string;
-                        ts?: string;
-                        payload?: unknown;
-                      };
-                      return (
-                        <details key={i} className="raw-row">
-                          <summary>
-                            #{r.seq} {r.dir} {r.tool ?? ''} {r.status ?? ''}{' '}
-                            <span style={{ color: 'var(--text-muted)' }}>{r.ts}</span>
-                          </summary>
-                          <pre className="raw-payload">{JSON.stringify(r.payload, null, 2)}</pre>
-                        </details>
-                      );
-                    })}
-                  </div>
-                ))}
-              {tab === 'log' &&
-                (log ? (
-                  <pre className="log-view">{log}</pre>
-                ) : (
-                  <div className="empty">
-                    <h3>No distill.log</h3>
-                  </div>
-                ))}
-            </div>
-          </>
-        )}
-      </main>
-      {toast && <Toast message={toast.msg} error={toast.error} />}
+          )}
+        </div>
+      </div>
+
+      <SessionToolbar
+        selected={selected}
+        sessions={sessions}
+        projects={projects}
+        onChanged={(preferId) => void refresh(preferId)}
+      />
     </div>
-  );
+  )
 }

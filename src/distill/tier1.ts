@@ -24,7 +24,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
 import { chat, modelId } from '../lib/nvidia.js';
-import type { BatchMeta, DigestEvent, DigestRecord, RawRecord } from '../lib/schema.js';
+import type { BatchMeta, DigestEvent, DigestRecord, ImageRef, RawRecord } from '../lib/schema.js';
 import {
   appendJsonl,
   atomicWrite,
@@ -46,6 +46,104 @@ const INACTIVITY_MS = 90_000;
 const POLL_MS = 500;
 const DEAD_TAP_IDLE_MS = 5 * 60_000;
 const IDLE_MEMORY_MS = 10 * 60_000; // auto memory update after this much record silence
+
+/** Protocol noise — never batched, never counted toward pair flushes. */
+const NOISE_METHODS = new Set([
+  'ping',
+  'initialize',
+  'tools/list',
+  'resources/list',
+  'prompts/list',
+]);
+
+function isNoiseMethod(method: string | undefined): boolean {
+  if (!method) return false;
+  if (NOISE_METHODS.has(method)) return true;
+  return method.startsWith('notifications/');
+}
+
+/**
+ * Track request methods by JSON-RPC id so responses to noise methods (which
+ * often omit `method`/`tool`) are filtered with their requests.
+ */
+class NoiseTracker {
+  private pending = new Map<string | number, boolean>();
+
+  /** Returns true when this record should be excluded from digestion. */
+  isNoise(rec: RawRecord): boolean {
+    if (rec.dir === 'meta' || rec.dir === 'err' || rec.dir === 'raw') return false;
+    if (rec.dir === 'req') {
+      const noise = isNoiseMethod(rec.method) || isNoiseMethod(rec.tool);
+      if (rec.id !== undefined && rec.id !== null) this.pending.set(rec.id, noise);
+      return noise;
+    }
+    if (rec.dir === 'res') {
+      if (rec.id !== undefined && rec.id !== null && this.pending.has(rec.id)) {
+        const noise = this.pending.get(rec.id) === true;
+        this.pending.delete(rec.id);
+        return noise;
+      }
+      return isNoiseMethod(rec.method) || isNoiseMethod(rec.tool);
+    }
+    return false;
+  }
+}
+
+/** Collect image_ref paths from a raw payload (MCP content arrays). */
+function imageRefsFromPayload(payload: unknown): string[] {
+  const p = payload as { content?: unknown } | undefined;
+  if (!p || !Array.isArray(p.content)) return [];
+  const out: string[] = [];
+  for (const item of p.content) {
+    const it = item as ImageRef | Record<string, unknown>;
+    if (it && it.type === 'image_ref' && typeof it.image_ref === 'string' && it.image_ref) {
+      out.push(it.image_ref);
+    }
+  }
+  return out;
+}
+
+/** Deterministic: attach artifact paths from raw records cited by event.src. */
+function attachArtifacts(events: DigestEvent[], records: RawRecord[]): void {
+  const bySeq = new Map(records.map((r) => [r.seq, r]));
+  for (const ev of events) {
+    const paths: string[] = [];
+    const seen = new Set<string>();
+    for (const seq of ev.src) {
+      const rec = bySeq.get(seq);
+      if (!rec) continue;
+      for (const ref of imageRefsFromPayload(rec.payload)) {
+        if (!seen.has(ref)) {
+          seen.add(ref);
+          paths.push(ref);
+        }
+      }
+    }
+    if (paths.length > 0) ev.artifacts = paths;
+  }
+}
+
+function sanitizeTitle(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const t = raw.replace(/[\r\n]+/g, ' ').replace(/^["'`]+|["'`]+$/g, '').trim();
+  if (t.length < 3 || t.length > 80) return undefined;
+  // Prefer short titles; truncate softly at word boundary past 6 words.
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return undefined;
+  return words.slice(0, 8).join(' ');
+}
+
+function maybeWriteSessionTitle(sessionDir: string, title: string | undefined): void {
+  if (!title) return;
+  try {
+    const info = readSessionInfo(sessionDir);
+    if (!info || info.title) return;
+    writeSessionInfo(sessionDir, { ...info, title });
+    console.error(`[horatio watch] session title: ${title}`);
+  } catch {
+    /* best-effort */
+  }
+}
 
 // ---------------------------------------------------------------------------
 // record stream
@@ -195,9 +293,18 @@ export async function runTier1Batch(
   records: RawRecord[],
   batchId: string,
   trigger: BatchMeta['trigger'],
-  digestFile: string
+  digestFile: string,
+  opts?: {
+    /** Inclusive coverage range — may extend beyond `records` to absorb filtered noise. */
+    srcRange?: [number, number];
+    wantTitle?: boolean;
+    sessionDir?: string;
+  }
 ): Promise<boolean> {
-  const srcRange: [number, number] = [records[0].seq, records[records.length - 1].seq];
+  const srcRange: [number, number] = opts?.srcRange ?? [
+    records[0].seq,
+    records[records.length - 1].seq,
+  ];
   const ts = records[records.length - 1].ts; // last source ts → replay-deterministic
   const meta: BatchMeta = {
     kind: 'batch',
@@ -208,6 +315,7 @@ export async function runTier1Batch(
     status: 'ok',
     ts,
   };
+  const wantTitle = opts?.wantTitle === true;
 
   try {
     // A dense batch can overflow the output cap (truncated JSON) — escalate once.
@@ -215,7 +323,7 @@ export async function runTier1Batch(
     try {
       raw = await chat({
         system: TIER1_SYSTEM,
-        user: buildTier1User(batchId, records),
+        user: buildTier1User(batchId, records, { wantTitle }),
         json: true,
         maxTokens: 8192,
       });
@@ -224,12 +332,12 @@ export async function runTier1Batch(
       console.error(`[horatio watch] ${batchId}: output truncated, retrying with larger cap`);
       raw = await chat({
         system: TIER1_SYSTEM,
-        user: buildTier1User(batchId, records),
+        user: buildTier1User(batchId, records, { wantTitle }),
         json: true,
         maxTokens: 16384,
       });
     }
-    const parsed = JSON.parse(raw) as { events?: unknown[] };
+    const parsed = JSON.parse(raw) as { events?: unknown[]; title?: unknown };
     if (!Array.isArray(parsed.events)) {
       console.error(
         `[horatio watch] ${batchId}: model returned no events array: ${raw.slice(0, 300)}`
@@ -246,7 +354,7 @@ export async function runTier1Batch(
         );
         continue;
       }
-      // Traceability guard: sources must exist within this batch.
+      // Traceability guard: sources must exist within this batch's coverage.
       const src = v.data.src.filter((s) => s >= srcRange[0] && s <= srcRange[1]);
       if (src.length === 0) {
         console.error(`[horatio watch] ${batchId}: dropping event with out-of-range src`);
@@ -254,8 +362,12 @@ export async function runTier1Batch(
       }
       events.push({ kind: 'event', batch: batchId, ts, ...v.data, src });
     }
+    attachArtifacts(events, records);
     appendJsonl(digestFile, meta);
     for (const e of events) appendJsonl(digestFile, e);
+    if (wantTitle && opts?.sessionDir) {
+      maybeWriteSessionTitle(opts.sessionDir, sanitizeTitle(parsed.title));
+    }
     console.error(
       `[horatio watch] ${batchId} ok: ${events.length} events from seq ${srcRange[0]}-${srcRange[1]} (${trigger})`
     );
@@ -351,9 +463,16 @@ async function runTier1Locked(
   const fromSeq = startCovered + 1;
 
   const detector = new BlendDetector({ id: path.basename(dir), dir });
+  const noise = new NoiseTracker();
 
+  /** Substantive records only — what the model sees. */
   let buffer: RawRecord[] = [];
   let pairsDone = 0;
+  /** First seq seen since last successful flush (includes filtered noise). */
+  let rangeStart: number | null = null;
+  /** Last seq seen since last successful flush (includes filtered noise). */
+  let lastSeenSeq = startCovered;
+  let lastSeenTs: string | undefined;
   let tapPid: number | undefined;
   let sawSessionEnd = false;
   let endedViaDeadTap = false;
@@ -361,17 +480,31 @@ async function runTier1Locked(
   let coveredSeq = startCovered;
   let lastMemorySeq = readMemoryCoverage(dir);
   let idleMemoryArmed = true;
+  let wantTitle = !readSessionInfo(dir)?.title;
 
   const flush = async (trigger: BatchMeta['trigger']): Promise<void> => {
+    // Noise-only windows: keep them attached to the next substantive flush so
+    // srcRange stays contiguous. Never write empty/noise-only batches.
     if (buffer.length === 0) return;
     const id = `b${String(++batchCounter).padStart(4, '0')}`;
     const records = buffer;
-    const lastSeq = records[records.length - 1].seq;
+    const srcRange: [number, number] = [
+      rangeStart ?? records[0].seq,
+      lastSeenSeq >= records[0].seq ? lastSeenSeq : records[records.length - 1].seq,
+    ];
     buffer = [];
     pairsDone = 0;
-    const ok = await runTier1Batch(records, id, trigger, digestFile);
+    rangeStart = null;
+    const ok = await runTier1Batch(records, id, trigger, digestFile, {
+      srcRange,
+      wantTitle,
+      sessionDir: dir,
+    });
     batchesRun++;
-    if (ok) coveredSeq = lastSeq; // contiguous because we flush in order
+    if (ok) {
+      coveredSeq = srcRange[1]; // contiguous because we absorb noise into the range
+      if (wantTitle) wantTitle = !readSessionInfo(dir)?.title;
+    }
   };
 
   const shouldStop = (idleMs: number): boolean => {
@@ -423,21 +556,29 @@ async function runTier1Locked(
     if (rec.dir === 'meta') {
       if (rec.meta?.event === 'session_start') tapPid = rec.meta.tapPid;
       if (rec.meta?.event === 'session_end') {
-        buffer.push(rec);
+        // Meta is never substantive content for the model; just ends the run.
         await flush('session_end');
         sawSessionEnd = true;
         break;
       }
-      buffer.push(rec);
+      // Other meta (session_start): absorb into coverage, never send to model.
+      if (rangeStart === null) rangeStart = rec.seq;
+      lastSeenSeq = rec.seq;
+      lastSeenTs = rec.ts;
       continue;
     }
 
     // Deterministic inactivity boundary: flush BEFORE admitting a record that
     // arrives ≥90s after the previous one (replay sees the same gap).
-    const prev = buffer[buffer.length - 1];
-    if (prev && Date.parse(rec.ts) - Date.parse(prev.ts) >= INACTIVITY_MS) {
+    if (lastSeenTs && Date.parse(rec.ts) - Date.parse(lastSeenTs) >= INACTIVITY_MS) {
       await flush('inactivity');
     }
+
+    if (rangeStart === null) rangeStart = rec.seq;
+    lastSeenSeq = rec.seq;
+    lastSeenTs = rec.ts;
+
+    if (noise.isNoise(rec)) continue; // filtered — stays in srcRange, not in buffer
 
     buffer.push(rec);
     if (rec.dir === 'res' && ++pairsDone >= PAIRS_PER_BATCH) {

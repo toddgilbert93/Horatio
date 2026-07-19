@@ -51,14 +51,39 @@ function loadRenderer(
   }
 }
 
+function resolveAppIcon(): string | undefined {
+  const candidates = [
+    join(__dirname, '../../build/icon.png'),
+    join(__dirname, '../../build/icon.icns'),
+    join(process.resourcesPath ?? '', 'icon.png'),
+  ];
+  return candidates.find((p) => p && existsSync(p));
+}
+
+function applyDockBrand(): void {
+  const icon = resolveAppIcon();
+  if (process.platform === 'darwin' && app.dock && icon) {
+    app.dock.setIcon(icon);
+  }
+}
+
 function createWindow(): void {
+  const icon = resolveAppIcon();
   const win = new BrowserWindow({
-    width: 1280,
-    height: 840,
-    minWidth: 960,
-    minHeight: 600,
-    title: 'flightrec',
-    backgroundColor: '#1a1b1e',
+    width: 600,
+    height: 320,
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    title: 'Horatio',
+    backgroundColor: '#041300',
+    ...(process.platform === 'darwin'
+      ? {
+          titleBarStyle: 'hiddenInset' as const,
+          trafficLightPosition: { x: 14, y: 14 },
+        }
+      : {}),
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: resolvePreload(),
       contextIsolation: true,
@@ -76,13 +101,15 @@ function openPreferences(): void {
     return;
   }
 
+  const icon = resolveAppIcon();
   prefsWindow = new BrowserWindow({
     width: 720,
     height: 640,
     minWidth: 520,
     minHeight: 420,
-    title: 'Preferences',
-    backgroundColor: '#1a1b1e',
+    title: 'Horatio Preferences',
+    backgroundColor: '#FBF9F6',
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: resolvePreload(),
       contextIsolation: true,
@@ -184,6 +211,21 @@ function buildMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+app.setName('Horatio');
+
+process.on('uncaughtException', (err) => {
+  console.error('[horatio] uncaughtException', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[horatio] unhandledRejection', reason);
+});
+app.on('render-process-gone', (_event, _webContents, details) => {
+  console.error('[horatio] render-process-gone', details);
+});
+app.on('child-process-gone', (_event, details) => {
+  console.error('[horatio] child-process-gone', details);
+});
+
 app.whenReady().then(async () => {
   // Query-param form avoids Chromium treating path segments (e.g. "Users")
   // as a host — which breaks file:// conversion for Application Support paths.
@@ -201,6 +243,7 @@ app.whenReady().then(async () => {
 
   await registerIpc(ipcMain, shell);
   buildMenu();
+  applyDockBrand();
   createWindow();
 
   app.on('activate', () => {

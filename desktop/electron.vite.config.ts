@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
   main: {
@@ -33,6 +34,11 @@ export default defineConfig({
   },
   renderer: {
     root: 'src/renderer',
+    resolve: {
+      alias: {
+        '@': resolve('src/renderer'),
+      },
+    },
     build: {
       rollupOptions: {
         input: {
@@ -40,6 +46,7 @@ export default defineConfig({
         },
       },
     },
-    plugins: [react()],
+    plugins: [react(), tailwindcss()],
+    assetsInclude: ['**/*.glb'],
   },
 });

@@ -13,6 +13,18 @@ export type SessionSummary = {
   artifactCount: number;
 };
 
+/** Flat session row for the main window dropdown. */
+export type SessionListItem = {
+  id: string;
+  dir: string;
+  title?: string;
+  startedAt?: string;
+  endedAt?: string;
+  blendId?: string;
+  blendName?: string;
+  hasDigest: boolean;
+};
+
 export type InstallStatus = {
   storeHome: string;
   clients: Array<{
@@ -79,34 +91,32 @@ const api = {
   openBlend: (blendPath: string) => ipcRenderer.invoke('blend:open', blendPath) as Promise<boolean>,
   listSessions: (project: string) =>
     ipcRenderer.invoke('sessions:list', project) as Promise<SessionSummary[]>,
-  getProjectTimeline: (project: string) =>
-    ipcRenderer.invoke('project:timeline', project) as Promise<
-      Array<SessionSummary & { records: unknown[] }>
-    >,
-  getProjectNotes: (project: string) =>
-    ipcRenderer.invoke('project:notes', project) as Promise<
-      Array<{ sessionId: string; note: string }>
-    >,
-  getProjectArtifacts: (project: string) =>
-    ipcRenderer.invoke('project:artifacts', project) as Promise<
-      Array<{ sessionId: string; name: string; path: string; url: string }>
-    >,
-  getNote: (sessionDir: string) => ipcRenderer.invoke('session:note', sessionDir) as Promise<string>,
+  listAllSessions: () =>
+    ipcRenderer.invoke('sessions:list-all') as Promise<SessionListItem[]>,
   getDigest: (sessionDir: string) =>
     ipcRenderer.invoke('session:digest', sessionDir) as Promise<unknown[]>,
-  getRaw: (sessionDir: string, limit?: number) =>
-    ipcRenderer.invoke('session:raw', sessionDir, limit) as Promise<unknown[]>,
-  getDistillLog: (sessionDir: string) =>
-    ipcRenderer.invoke('session:distillLog', sessionDir) as Promise<string>,
-  getArtifacts: (sessionDir: string) =>
-    ipcRenderer.invoke('session:artifacts', sessionDir) as Promise<
-      Array<{ name: string; path: string; url: string }>
-    >,
-  getProjectState: (project: string) =>
-    ipcRenderer.invoke('project:state', project) as Promise<{
-      state: string;
-      decisions: unknown[];
-      dir: string;
+  mergeSessions: (sourceIds: string[], targetId: string, blendPath?: string) =>
+    ipcRenderer.invoke('sessions:merge', sourceIds, targetId, blendPath) as Promise<{
+      ok: boolean;
+      merged?: number;
+      error?: string;
+    }>,
+  linkSession: (sessionId: string, blendPath: string) =>
+    ipcRenderer.invoke('session:link', sessionId, blendPath) as Promise<{
+      ok: boolean;
+      error?: string;
+    }>,
+  pickBlend: () =>
+    ipcRenderer.invoke('dialog:pick-blend') as Promise<{
+      canceled: boolean;
+      blendPath?: string;
+    }>,
+  exportSession: (sessionId: string) =>
+    ipcRenderer.invoke('session:export', sessionId) as Promise<{
+      ok: boolean;
+      canceled?: boolean;
+      outPath?: string;
+      error?: string;
     }>,
   reveal: (targetPath: string) => ipcRenderer.invoke('reveal', targetPath) as Promise<boolean>,
   openPath: (targetPath: string) => ipcRenderer.invoke('open-path', targetPath) as Promise<void>,
@@ -126,30 +136,6 @@ const api = {
     ipcRenderer.invoke('apikey:set', key) as Promise<{ set: boolean; envPath: string }>,
   clearApiKey: () =>
     ipcRenderer.invoke('apikey:clear') as Promise<{ set: boolean; envPath: string }>,
-  distillSave: (sessionRef: string, project: string) =>
-    ipcRenderer.invoke('distill:save', sessionRef, project) as Promise<{
-      ok: boolean;
-      output: string;
-    }>,
-  distillReplay: (sessionRef: string, project: string) =>
-    ipcRenderer.invoke('distill:replay', sessionRef, project) as Promise<{
-      ok: boolean;
-      output: string;
-    }>,
-  exportAgentMemory: (
-    sessionDir: string,
-    project: string,
-    opts?: { assemble?: boolean; saveAs?: boolean }
-  ) =>
-    ipcRenderer.invoke('export:agent-memory', sessionDir, project, opts) as Promise<{
-      ok: boolean;
-      canceled?: boolean;
-      sessionPath?: string;
-      projectPath?: string;
-      outPath?: string;
-      markdown?: string;
-      error?: string;
-    }>,
   migrateScan: () =>
     ipcRenderer.invoke('migrate:scan') as Promise<{
       hasData: boolean;

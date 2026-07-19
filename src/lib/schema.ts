@@ -83,6 +83,9 @@ export interface DigestEvent {
   };
   /** Exact values worth remembering: {"tri_budget": 15000, "object": "Tree.001"} */
   params?: Record<string, string | number>;
+  /** Paths relative to the session dir (e.g. "artifacts/shot-42.png"), filled
+   *  deterministically from raw image_refs cited by src — not by the model. */
+  artifacts?: string[];
 }
 
 export type DigestRecord = BatchMeta | DigestEvent;
@@ -103,9 +106,9 @@ export interface DecisionEntry {
 // Atomic tmp+rename writes; readers merge the three.
 // ---------------------------------------------------------------------------
 
-/** sessions/<id>/session.json — written by the TAP only (lifecycle). The one
- *  cross-writer exception: the follower stamps endReason:'inactivity' on the
- *  dead-tap path, when the tap can no longer write anything. */
+/** sessions/<id>/session.json — primarily written by the TAP (lifecycle).
+ *  Cross-writer exceptions: the follower stamps endReason:'inactivity' on the
+ *  dead-tap path, and Tier 1 may set `title` after the first successful batch. */
 export interface SessionInfo {
   id: string;
   startedAt: string;
@@ -113,6 +116,8 @@ export interface SessionInfo {
   endReason?: 'session_end' | 'inactivity';
   tapPid?: number;
   cmd?: string[];
+  /** Short AI-generated label (3–6 words), set by Tier 1 on first ok batch. */
+  title?: string;
 }
 
 /** sessions/<id>/link.json — the session's Blender-file binding.
