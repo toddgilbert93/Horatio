@@ -477,6 +477,22 @@ async function runTier1Locked(
   let lastSeenSeq = startCovered;
   let lastSeenTs: string | undefined;
   let tapPid: number | undefined;
+  // A resumed follower starts past the seq-0 session_start meta and would
+  // otherwise never learn the tap pid — then give up as "tap gone" after the
+  // first quiet stretch. Recover it from the head of the log.
+  if (fromSeq > 0) {
+    try {
+      const fd = fs.openSync(raw, 'r');
+      const buf = Buffer.alloc(4096);
+      const n = fs.readSync(fd, buf, 0, 4096, 0);
+      fs.closeSync(fd);
+      const head = buf.toString('utf8', 0, n).split('\n')[0];
+      const rec = JSON.parse(head) as RawRecord;
+      if (rec.dir === 'meta' && rec.meta?.event === 'session_start') tapPid = rec.meta.tapPid;
+    } catch {
+      /* unreadable head — fall back to stream discovery */
+    }
+  }
   let sawSessionEnd = false;
   let endedViaDeadTap = false;
   let batchesRun = 0;
