@@ -8,10 +8,19 @@
  * Logging is a separate read of the same streams: newline-split, JSON-parsed
  * per line; a parse failure logs a raw record and changes nothing else.
  *
- * v2: session dirs are flat and NEVER move, so paths are stable for the whole
- * process. The tap owns session.json (lifecycle) and its live/ pointer; it
- * does no blend detection and no store scans — nothing runs on the forwarding
- * path but forwarding.
+ * v2: session dirs are flat and NEVER move, so paths are stable for a
+ * session's whole lifetime. The tap owns session.json (lifecycle) and its
+ * live/ pointer; it does no blend detection and no store scans — nothing runs
+ * on the forwarding path but forwarding.
+ *
+ * Session rotation: long-lived MCP clients (Cursor) keep one tap process
+ * alive for days, so "one session per process" would smear unrelated work
+ * into a single session. When a substantive request arrives after a long idle
+ * gap (default 30 min, HORATIO_ROTATE_IDLE_MS to tune, ≤0 disables), the tap
+ * closes the current session exactly like a real end (session_end meta →
+ * follower flushes + folds memory) and opens a fresh one. Rotation lives on
+ * the logging path only and is fully try/caught — a rotation failure means we
+ * keep writing to the old session, never a crash.
  *
  * node:* builtins only. Boring is the spec.
  */
@@ -29,6 +38,7 @@ import {
   removeLivePointer,
   writeLivePointer,
   writeSessionInfo,
+  type SessionRef,
 } from './lib/store.js';
 
 // --------------------------------------------------------------------------
@@ -44,27 +54,108 @@ if (childCmd.length === 0) {
 // --------------------------------------------------------------------------
 // session + log stream (recording never blocks on store state — v1 stores
 // get v2-shaped sessions appended; migration unifies later)
+//
+// Session state is a unit swapped atomically by rotation: dir, raw stream,
+// and the per-session seq counter.
 // --------------------------------------------------------------------------
 ensureRecordingHome();
-const session = newSessionDir();
-const logFile = rawPath(session.dir);
-const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-logStream.on('error', () => { /* logging must never take down forwarding */ });
 
-try {
-  writeSessionInfo(session.dir, {
-    id: session.id,
-    startedAt: new Date().toISOString(),
-    tapPid: process.pid,
-    cmd: childCmd,
-  });
-  writeLivePointer(session, process.pid);
-} catch {
-  /* metadata is best-effort; raw recording carries the ground truth */
-}
+/** Idle gap after which the NEXT substantive request starts a fresh session. */
+const ROTATE_IDLE_MS = (() => {
+  const raw = process.env.HORATIO_ROTATE_IDLE_MS;
+  if (raw !== undefined && raw.trim() !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n)) return n; // ≤ 0 disables rotation
+  }
+  return 30 * 60 * 1000;
+})();
 
+let session!: SessionRef;
+let logFile!: string;
+let logStream!: fs.WriteStream;
 let closed = false;
 let seq = 0;
+/** Last time we logged substantive (non-protocol-noise) traffic. */
+let lastSubstantiveMs = Date.now();
+
+/** Open a fresh session: dir + stream + metadata + live pointer + follower. */
+function openSession(): void {
+  const next = newSessionDir();
+  const nextLogFile = rawPath(next.dir);
+  const nextStream = fs.createWriteStream(nextLogFile, { flags: 'a' });
+  nextStream.on('error', () => { /* logging must never take down forwarding */ });
+  // Everything that can throw has succeeded — commit the swap.
+  session = next;
+  logFile = nextLogFile;
+  logStream = nextStream;
+  seq = 0;
+  lastSubstantiveMs = Date.now();
+  try {
+    writeSessionInfo(session.dir, {
+      id: session.id,
+      startedAt: new Date().toISOString(),
+      tapPid: process.pid,
+      cmd: childCmd,
+    });
+    writeLivePointer(session, process.pid);
+  } catch {
+    /* metadata is best-effort; raw recording carries the ground truth */
+  }
+  writeRecord({
+    dir: 'meta',
+    bytes: 0,
+    meta: { event: 'session_start', cmd: childCmd, tapPid: process.pid },
+  });
+  spawnFollower(session);
+}
+
+/**
+ * Open a fresh session, then close the old one the same way a real end would
+ * — session_end meta so its live follower flushes + folds memory. Order
+ * matters: if opening the new session throws, the old one is untouched and
+ * recording simply continues there.
+ */
+function rotateSession(): void {
+  const old = session;
+  const oldStream = logStream;
+  const oldEndSeq = seq;
+  openSession(); // swaps session/logFile/logStream/seq — may throw (caller catches)
+
+  try {
+    const full: RawRecord = {
+      ts: new Date().toISOString(),
+      seq: oldEndSeq,
+      dir: 'meta',
+      bytes: 0,
+      meta: { event: 'session_end' },
+    };
+    oldStream.write(JSON.stringify(full) + '\n');
+  } catch { /* ignore */ }
+  try {
+    const info = readSessionInfo(old.dir);
+    if (info) {
+      writeSessionInfo(old.dir, {
+        ...info,
+        endedAt: new Date().toISOString(),
+        endReason: 'rotated',
+      });
+    }
+  } catch { /* ignore */ }
+  try { removeLivePointer(old.id); } catch { /* ignore */ }
+  try { oldStream.end(); } catch { /* ignore */ }
+  console.error(`[horatio tap] rotated session ${old.id} -> ${session.id} (idle >= ${ROTATE_IDLE_MS}ms)`);
+}
+
+/** Rotation check — called only for substantive requests, never throws. */
+function maybeRotate(): void {
+  if (closed || ROTATE_IDLE_MS <= 0) return;
+  if (Date.now() - lastSubstantiveMs < ROTATE_IDLE_MS) return;
+  try {
+    rotateSession();
+  } catch {
+    /* rotation failure: keep recording into the current session */
+  }
+}
 
 function writeRecord(rec: Omit<RawRecord, 'ts' | 'seq'>): void {
   if (closed) return;
@@ -160,6 +251,23 @@ class LineSplitter {
 }
 
 /**
+ * Protocol chatter that must not count as activity for session rotation —
+ * Cursor pings and list-refreshes forever, so an "any traffic" clock would
+ * never see an idle gap. Mirrors the distiller's noise set (tier1.ts).
+ */
+const NOISE_METHODS = new Set([
+  'ping',
+  'initialize',
+  'tools/list',
+  'resources/list',
+  'prompts/list',
+]);
+
+function isProtocolNoise(name: string): boolean {
+  return NOISE_METHODS.has(name) || name.startsWith('notifications/');
+}
+
+/**
  * req id → tool name, so responses (which carry no method) can be attributed.
  * Keyed by originating stream: client ids ('in') and server-initiated ids
  * ('out') are separate JSON-RPC id spaces and may collide.
@@ -209,8 +317,13 @@ function logMessage(msg: unknown, bytes: number, source: 'in' | 'out'): void {
       typeof (m.params as Record<string, unknown> | undefined)?.name === 'string'
         ? ((m.params as Record<string, unknown>).name as string)
         : m.method;
+    const substantive = !isProtocolNoise(m.method);
+    // Rotate on the request boundary so a req/res pair never straddles two
+    // sessions; the request below is then the new session's first record.
+    if (substantive) maybeRotate();
     if (hasId) rememberRequest(source, id as number | string, tool);
     writeRecord({ dir: 'req', id, method: m.method, tool, payload: m.params, bytes });
+    if (substantive) lastSubstantiveMs = Date.now();
     return;
   }
 
@@ -231,6 +344,8 @@ function logMessage(msg: unknown, bytes: number, source: 'in' | 'out'): void {
       payload,
       bytes,
     });
+    // Unknown attribution counts as substantive — err toward NOT rotating.
+    if (!known || !isProtocolNoise(known.tool)) lastSubstantiveMs = Date.now();
     return;
   }
 
@@ -307,11 +422,7 @@ child.stderr!.on('data', (c: Buffer) => {
 // --------------------------------------------------------------------------
 // lifecycle
 // --------------------------------------------------------------------------
-writeRecord({
-  dir: 'meta',
-  bytes: 0,
-  meta: { event: 'session_start', cmd: childCmd, tapPid: process.pid },
-});
+openSession();
 
 child.on('exit', (code) => {
   writeFinalRecord({ event: 'session_end', exitCode: code });
@@ -330,17 +441,18 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 // --------------------------------------------------------------------------
-// auto-spawn the live-activity follower (fire-and-forget; failure never
-// touches forwarding)
+// auto-spawn the live-activity follower — once per session (fire-and-forget;
+// failure never touches forwarding)
 // --------------------------------------------------------------------------
-const noActivity =
-  process.env.HORATIO_NO_ACTIVITY === '1' || process.env.FLIGHTREC_NO_AUTODISTILL === '1';
-if (!noActivity) {
+function spawnFollower(target: SessionRef): void {
+  const noActivity =
+    process.env.HORATIO_NO_ACTIVITY === '1' || process.env.FLIGHTREC_NO_AUTODISTILL === '1';
+  if (noActivity) return;
   try {
     const cliPath = fileURLToPath(new URL('./distill/cli.js', import.meta.url));
     if (fs.existsSync(cliPath)) {
-      const logFd = fs.openSync(path.join(session.dir, 'distill.log'), 'a');
-      spawn(process.execPath, [cliPath, 'watch', session.id], {
+      const logFd = fs.openSync(path.join(target.dir, 'distill.log'), 'a');
+      spawn(process.execPath, [cliPath, 'watch', target.id], {
         detached: true,
         stdio: ['ignore', logFd, logFd],
       }).unref();
