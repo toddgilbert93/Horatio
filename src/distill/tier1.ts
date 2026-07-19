@@ -42,7 +42,10 @@ import { BlendDetector } from '../lib/blend-link.js';
 import { buildTier1User, TIER1_SYSTEM } from './prompts.js';
 
 const PAIRS_PER_BATCH = 10;
-const INACTIVITY_MS = 90_000;
+// Batch-boundary gap. Overridable for demos/tests; note a non-default value
+// changes which batches `rebuild` reproduces (boundaries derive from this).
+const INACTIVITY_MS =
+  Number(process.env.HORATIO_INACTIVITY_MS) > 0 ? Number(process.env.HORATIO_INACTIVITY_MS) : 90_000;
 const POLL_MS = 500;
 const DEAD_TAP_IDLE_MS = 5 * 60_000;
 const IDLE_MEMORY_MS = 10 * 60_000; // auto memory update after this much record silence
@@ -569,7 +572,7 @@ async function runTier1Locked(
     }
 
     // Deterministic inactivity boundary: flush BEFORE admitting a record that
-    // arrives ≥90s after the previous one (replay sees the same gap).
+    // arrives ≥INACTIVITY_MS after the previous one (replay sees the same gap).
     if (lastSeenTs && Date.parse(rec.ts) - Date.parse(lastSeenTs) >= INACTIVITY_MS) {
       await flush('inactivity');
     }
