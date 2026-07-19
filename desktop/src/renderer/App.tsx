@@ -74,6 +74,22 @@ export default function App() {
   const selectedRef = useRef<SessionListItem | null>(null)
   selectedRef.current = selected
   const [digest, setDigest] = useState<unknown[]>([])
+  // Last digest mtime the user has "seen" per session id. Baseline is set on
+  // first sight (no dots at startup); a later mtime means unseen activity.
+  const [seenMtimes, setSeenMtimes] = useState<Record<string, number>>({})
+  const baselinedRef = useRef(false)
+
+  const markSeen = useCallback((s: SessionListItem) => {
+    setSeenMtimes((prev) => ({ ...prev, [s.id]: s.digestMtimeMs ?? 0 }))
+  }, [])
+
+  const isUnseen = useCallback(
+    (s: SessionListItem) => {
+      const seen = seenMtimes[s.id]
+      return seen !== undefined && (s.digestMtimeMs ?? 0) > seen
+    },
+    [seenMtimes]
+  )
 
   useEffect(() => {
     document.documentElement.dataset.theme = 'archive'
@@ -85,12 +101,16 @@ export default function App() {
     return sessions.filter((s) => s.blendId === projectFilter)
   }, [sessions, projectFilter])
 
-  const loadSession = useCallback(async (s: SessionListItem) => {
-    setSelected(s)
-    selectedRef.current = s
-    const d = await window.flightrec.getDigest(s.dir)
-    setDigest(d)
-  }, [])
+  const loadSession = useCallback(
+    async (s: SessionListItem) => {
+      setSelected(s)
+      selectedRef.current = s
+      markSeen(s) // viewing a session clears its alert dot
+      const d = await window.flightrec.getDigest(s.dir)
+      setDigest(d)
+    },
+    [markSeen]
+  )
 
   const pickSession = useCallback(
     async (list: SessionListItem[], preferId?: string | null) => {
@@ -114,6 +134,17 @@ export default function App() {
       ])
       setSessions(list)
       setProjects(projs)
+      // First load baselines everything at its current mtime (quiet startup);
+      // sessions that appear later baseline at 0 so their first digest dots.
+      const firstLoad = !baselinedRef.current
+      baselinedRef.current = true
+      setSeenMtimes((prev) => {
+        const next = { ...prev }
+        for (const s of list) {
+          if (next[s.id] === undefined) next[s.id] = firstLoad ? (s.digestMtimeMs ?? 0) : 0
+        }
+        return next
+      })
 
       const filter = projectFilterRef.current
       const visible =
@@ -202,8 +233,16 @@ export default function App() {
           </Select>
         </div>
 
-        <div className="flex min-w-0 flex-col">
-          <span className="px-2 text-[10px] leading-none text-muted-foreground">Sessions</span>
+        <div className="relative flex min-w-0 flex-col">
+          <span className="px-2 text-[10px] leading-none text-muted-foreground">
+            Sessions
+            {filteredSessions.some(isUnseen) && (
+              <span
+                className="ml-1.5 inline-block size-[6px] animate-pulse rounded-full bg-primary align-middle"
+                aria-label="New session activity"
+              />
+            )}
+          </span>
           <Select
             value={selected?.id}
             onValueChange={(id) => {
@@ -221,7 +260,12 @@ export default function App() {
             <SelectContent>
               {filteredSessions.map((s) => (
                 <SelectItem key={s.id} value={s.id} className="text-[13px]">
-                  {sessionLabel(s)}
+                  <span className="flex items-center gap-1.5">
+                    {sessionLabel(s)}
+                    {isUnseen(s) && (
+                      <span className="inline-block size-[6px] shrink-0 animate-pulse rounded-full bg-primary" />
+                    )}
+                  </span>
                 </SelectItem>
               ))}
             </SelectContent>

@@ -278,6 +278,7 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
       blendId?: string;
       blendName?: string;
       hasDigest: boolean;
+      digestMtimeMs?: number;
     }> = [];
     for (const s of store.listSessions()) {
       if (readMergeInfo(s.dir)) continue; // folded into another session
@@ -288,6 +289,12 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
         const meta = store.readBlendMeta(link.blendId);
         blendName = meta?.name || path.basename(link.blendPath || '');
       }
+      let digestMtimeMs: number | undefined;
+      try {
+        digestMtimeMs = fs.statSync(store.digestPath(s.dir)).mtimeMs;
+      } catch {
+        /* no digest yet */
+      }
       out.push({
         id: s.id,
         dir: s.dir,
@@ -296,7 +303,8 @@ export async function registerIpc(ipcMain: IpcMain, shell: Shell): Promise<void>
         endedAt: info?.endedAt,
         blendId: link?.blendId,
         blendName: blendName || undefined,
-        hasDigest: fs.existsSync(store.digestPath(s.dir)),
+        hasDigest: digestMtimeMs !== undefined,
+        digestMtimeMs,
       });
     }
     return out; // listSessions() is already newest-first

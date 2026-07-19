@@ -23,6 +23,8 @@ export type SessionListItem = {
   blendId?: string;
   blendName?: string;
   hasDigest: boolean;
+  /** mtime of digest.jsonl — drives the "new activity" alert dot. */
+  digestMtimeMs?: number;
 };
 
 export type InstallStatus = {
