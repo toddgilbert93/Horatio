@@ -15,10 +15,11 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { sessionLabel } from '@/lib/session'
 import { showToast } from '@/lib/toast'
+import { ScrambleText } from './ScrambleText'
 
 type ProjectOption = { id: string; name: string; blendPath: string }
 
-const btnClass = 'font-display text-[13px] font-normal tracking-[0.02em]'
+const btnClass = 'font-doto text-[13px]'
 
 export function SessionToolbar({
   selected,
@@ -108,7 +109,7 @@ export function SessionToolbar({
   return (
     <footer
       className="flex items-center justify-end gap-3 pr-4 pl-2 pb-4"
-      style={{ backgroundColor: '#041300' }}
+      style={{ backgroundColor: 'transparent' }}
     >
       <DropdownMenu onOpenChange={(open) => !open && setChecked({})}>
         <DropdownMenuTrigger asChild>
@@ -119,7 +120,7 @@ export function SessionToolbar({
             disabled={disabled || mergeCandidates.length === 0}
             style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
           >
-            Merge
+            <ScrambleText text="Merge" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent side="top" align="end" className="w-64">
@@ -185,7 +186,7 @@ export function SessionToolbar({
             disabled={disabled}
             style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
           >
-            Link
+            <ScrambleText text="Link" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent side="top" align="end" className="w-56">
@@ -219,7 +220,7 @@ export function SessionToolbar({
         onClick={() => void doExport()}
         style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
       >
-        Export
+        <ScrambleText text="Export" />
       </Button>
     </footer>
   )

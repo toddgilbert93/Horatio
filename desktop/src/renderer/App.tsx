@@ -2,6 +2,7 @@ import { Component, lazy, Suspense, useCallback, useEffect, useMemo, useRef, use
 import type { SessionListItem } from '../preload/index'
 import bustIcon from '@/assets/brand/bust-icon.png'
 import { Feed } from './components/Feed'
+import { FluidBackground } from './components/FluidBackground'
 import { SessionToolbar } from './components/SessionToolbar'
 import { sessionLabel } from '@/lib/session'
 import {
@@ -18,6 +19,7 @@ const BustViewer = lazy(() =>
 )
 
 const ALL_PROJECTS = '__all__'
+
 
 type ProjectInfo = {
   id: string
@@ -72,6 +74,10 @@ export default function App() {
   const selectedRef = useRef<SessionListItem | null>(null)
   selectedRef.current = selected
   const [digest, setDigest] = useState<unknown[]>([])
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = 'archive'
+  }, [])
 
   const filteredSessions = useMemo(() => {
     if (projectFilter === ALL_PROJECTS) return sessions
@@ -155,84 +161,77 @@ export default function App() {
   }
 
   return (
-    <div
-      className="flex h-full flex-col"
-      style={
-        {
-          backgroundColor: '#041300',
-          // Keep design tokens from painting lighter washes over the ink ground.
-          ['--background' as string]: '#041300',
-          ['--card' as string]: '#041300',
-          ['--muted' as string]: '#041300',
-          // Elevated fill so secondary toolbar buttons read against the ink ground.
-          ['--secondary' as string]: '#30372e',
-          ['--sidebar' as string]: '#041300',
-          ['--input' as string]: 'transparent',
-        } as CSSProperties
-      }
-    >
+    <div className="bg-background relative isolate flex h-full flex-col">
+      {/* Base: theme ground + bust */}
+      <div className="bg-background absolute inset-0 z-0">
+        <div className="absolute top-1/2 left-2 flex size-[180px] -translate-y-1/2 items-center justify-center overflow-hidden">
+          <BustErrorBoundary fallback={<BustFallback />}>
+            <Suspense fallback={<BustFallback />}>
+              <BustViewer rotating materialId="bone" style={{ maxWidth: 180, maxHeight: 180 }} />
+            </Suspense>
+          </BustErrorBoundary>
+        </div>
+      </div>
+
+      {/* Fluid wash on top of ground + bust */}
+      <FluidBackground />
+
       <header
-        className="flex items-center justify-end gap-2 py-2 pr-4 pl-[72px]"
-        style={{ WebkitAppRegion: 'drag', backgroundColor: '#041300' } as CSSProperties}
+        className="relative z-10 flex items-end justify-end gap-2 pt-5 pb-2 pr-4 pl-[72px]"
+        style={{ WebkitAppRegion: 'drag', backgroundColor: 'transparent' } as CSSProperties}
       >
-        <Select
-          value={selected?.id}
-          onValueChange={(id) => {
-            const s = filteredSessions.find((x) => x.id === id)
-            if (s) void loadSession(s)
-          }}
-          disabled={filteredSessions.length === 0}
-        >
-          <SelectTrigger
-            className={`${selectTriggerClass} w-[200px] max-w-[200px] min-w-0 shrink-0 overflow-hidden`}
-            style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
-          >
-            <SelectValue placeholder="No sessions yet" />
-          </SelectTrigger>
-          <SelectContent>
-            {filteredSessions.map((s) => (
-              <SelectItem key={s.id} value={s.id} className="text-[13px]">
-                {sessionLabel(s)}
+        <div className="flex shrink-0 flex-col">
+          <span className="px-2 text-[10px] leading-none text-muted-foreground">Projects</span>
+          <Select value={projectFilter} onValueChange={(v) => void selectProjectFilter(v)}>
+            <SelectTrigger
+              className={`${selectTriggerClass} w-[120px] shrink-0 text-muted-foreground`}
+              style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
+            >
+              <SelectValue placeholder="All projects" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL_PROJECTS} className="text-[13px]">
+                All projects
               </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-
-        <Select value={projectFilter} onValueChange={(v) => void selectProjectFilter(v)}>
-          <SelectTrigger
-            className={`${selectTriggerClass} w-[120px] shrink-0 text-muted-foreground`}
-            style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
-          >
-            <SelectValue placeholder="All projects" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL_PROJECTS} className="text-[13px]">
-              All projects
-            </SelectItem>
-            {projects.map((p) => (
-              <SelectItem key={p.id} value={p.id} className="text-[13px]">
-                {p.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </header>
-
-      <div className="flex min-h-0 flex-1" style={{ backgroundColor: '#041300' }}>
-        <div
-          className="flex w-[200px] shrink-0 items-center justify-center p-2"
-          style={{ backgroundColor: '#041300' }}
-        >
-          <div className="size-[180px] overflow-hidden" style={{ backgroundColor: '#041300' }}>
-            <BustErrorBoundary fallback={<BustFallback />}>
-              <Suspense fallback={<BustFallback />}>
-                <BustViewer rotating materialId="bone" style={{ maxWidth: 180, maxHeight: 180 }} />
-              </Suspense>
-            </BustErrorBoundary>
-          </div>
+              {projects.map((p) => (
+                <SelectItem key={p.id} value={p.id} className="text-[13px]">
+                  {p.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
 
-        <div className="min-w-0 flex-1 py-3 pr-4 pl-1" style={{ backgroundColor: '#041300' }}>
+        <div className="flex min-w-0 flex-col">
+          <span className="px-2 text-[10px] leading-none text-muted-foreground">Sessions</span>
+          <Select
+            value={selected?.id}
+            onValueChange={(id) => {
+              const s = filteredSessions.find((x) => x.id === id)
+              if (s) void loadSession(s)
+            }}
+            disabled={filteredSessions.length === 0}
+          >
+            <SelectTrigger
+              className={`${selectTriggerClass} w-[200px] max-w-[200px] min-w-0 shrink-0 overflow-hidden`}
+              style={{ WebkitAppRegion: 'no-drag' } as CSSProperties}
+            >
+              <SelectValue placeholder="No sessions yet" />
+            </SelectTrigger>
+            <SelectContent>
+              {filteredSessions.map((s) => (
+                <SelectItem key={s.id} value={s.id} className="text-[13px]">
+                  {sessionLabel(s)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </header>
+
+      <div className="relative z-10 flex min-h-0 flex-1">
+        <div className="w-[200px] shrink-0" />
+        <div className="min-w-0 flex-1 py-3 pr-4 pl-1">
           {selected ? (
             <Feed
               records={digest}
@@ -249,12 +248,14 @@ export default function App() {
         </div>
       </div>
 
-      <SessionToolbar
-        selected={selected}
-        sessions={sessions}
-        projects={projects}
-        onChanged={(preferId) => void refresh(preferId)}
-      />
+      <div className="relative z-10">
+        <SessionToolbar
+          selected={selected}
+          sessions={sessions}
+          projects={projects}
+          onChanged={(preferId) => void refresh(preferId)}
+        />
+      </div>
     </div>
   )
 }

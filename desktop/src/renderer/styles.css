@@ -17,6 +17,24 @@
   font-display: swap;
 }
 
+/* Doto — dot-matrix face, used on the toolbar buttons (bundled, offline-safe) */
+@font-face {
+  font-family: "Doto";
+  src: url("./assets/fonts/Doto.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* JetBrains Mono — primary UI face (bundled, offline-safe) */
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("./assets/fonts/JetBrainsMono.ttf") format("truetype");
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* Horatio palette — classical presence, digital craft */
 :root {
   --color-lightest: #fbf9f6;
@@ -53,6 +71,193 @@
   --sidebar: #041300;
   --sidebar-foreground: var(--color-lightest);
   --sidebar-border: color-mix(in srgb, var(--color-light-accent) 40%, transparent);
+}
+
+/* ---- Alternate themes (toggle in app header) ---------------------------- */
+
+/* Terminal — phosphor console, all mono */
+html[data-theme='terminal'] {
+  --background: #0a0f0a;
+  --foreground: #b9e6a3;
+  --card: #0a0f0a;
+  --card-foreground: #b9e6a3;
+  --popover: #131c13;
+  --popover-foreground: #b9e6a3;
+  --primary: #9fe870;
+  --primary-foreground: #0a0f0a;
+  --secondary: #1a231a;
+  --secondary-foreground: #9fe870;
+  --muted: #0a0f0a;
+  --muted-foreground: color-mix(in srgb, #9fe870 62%, transparent);
+  --accent: #1a231a;
+  --accent-foreground: #b9e6a3;
+  --border: color-mix(in srgb, #9fe870 32%, transparent);
+  --ring: #9fe870;
+  --sidebar: #0a0f0a;
+  --sidebar-foreground: #b9e6a3;
+  --sidebar-border: color-mix(in srgb, #9fe870 28%, transparent);
+  --font-display: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  --font-body: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* Archive — warm paper, classic book serif (light) */
+html[data-theme='archive'] {
+  --background: #f6f1e6;
+  --foreground: #2a241b;
+  --card: #fdfaf2;
+  --card-foreground: #2a241b;
+  --popover: #fdfaf2;
+  --popover-foreground: #2a241b;
+  --primary: #4a3f2c;
+  --primary-foreground: #f6f1e6;
+  --secondary: #e8dfc9;
+  --secondary-foreground: #3d3524;
+  --muted: #efe7d5;
+  --muted-foreground: #7a6e5b;
+  --accent: #e8dfc9;
+  --accent-foreground: #2a241b;
+  --border: #d8ccb1;
+  --ring: #4a3f2c;
+  --sidebar: #f6f1e6;
+  --sidebar-foreground: #2a241b;
+  --sidebar-border: #d8ccb1;
+  --font-display: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --font-body: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+
+/* Slate — cool night blue, modern grotesque sans */
+html[data-theme='slate'] {
+  --background: #0f1522;
+  --foreground: #dde5f0;
+  --card: #0f1522;
+  --card-foreground: #dde5f0;
+  --popover: #1a2334;
+  --popover-foreground: #dde5f0;
+  --primary: #93c5fd;
+  --primary-foreground: #0f1522;
+  --secondary: #22304a;
+  --secondary-foreground: #bcd3f5;
+  --muted: #0f1522;
+  --muted-foreground: color-mix(in srgb, #9db4d4 72%, transparent);
+  --accent: #22304a;
+  --accent-foreground: #dde5f0;
+  --border: color-mix(in srgb, #93a9c9 34%, transparent);
+  --ring: #93c5fd;
+  --sidebar: #0f1522;
+  --sidebar-foreground: #dde5f0;
+  --sidebar-border: color-mix(in srgb, #93a9c9 30%, transparent);
+  --font-display: ui-sans-serif, system-ui, "Helvetica Neue", sans-serif;
+  --font-body: ui-sans-serif, system-ui, "Helvetica Neue", sans-serif;
+}
+
+/* Aurora — Fluid AURORA swatches, Horatio fonts (Jacquard / Montaga) */
+html[data-theme='aurora'] {
+  --color-lightest: #edbfd5;
+  --color-light-accent: #6cc591;
+  --color-dark-accent: #306a72;
+  --color-dark: #0d6b77;
+
+  --background: #0d6b77;
+  --foreground: #edbfd5;
+  --card: #0d6b77;
+  --card-foreground: #edbfd5;
+  --popover: #306a72;
+  --popover-foreground: #edbfd5;
+  --primary: #6cc591;
+  --primary-foreground: #0a1027;
+  --secondary: #0a1027;
+  --secondary-foreground: #edbfd5;
+  --muted: #0d6b77;
+  --muted-foreground: color-mix(in srgb, #edbfd5 72%, transparent);
+  --accent: #0a1027;
+  --accent-foreground: #edbfd5;
+  --border: color-mix(in srgb, #6cc591 45%, transparent);
+  --ring: #6cc591;
+  --sidebar: #0d6b77;
+  --sidebar-foreground: #edbfd5;
+  --sidebar-border: color-mix(in srgb, #6cc591 40%, transparent);
+  /* keep existing Horatio typefaces from :root */
+}
+
+/* Ember — deep coal + flame, Horatio fonts (Jacquard / Montaga) */
+html[data-theme='ember'] {
+  --color-lightest: #fae6b8;
+  --color-light-accent: #e67321;
+  --color-dark-accent: #7d1a1a;
+  --color-dark: #090505;
+
+  --background: #090505;
+  --foreground: #fae6b8;
+  --card: #090505;
+  --card-foreground: #fae6b8;
+  --popover: #7d1a1a;
+  --popover-foreground: #fae6b8;
+  --primary: #e67321;
+  --primary-foreground: #090505;
+  --secondary: #7d1a1a;
+  --secondary-foreground: #fae6b8;
+  --muted: #090505;
+  --muted-foreground: color-mix(in srgb, #fae6b8 70%, transparent);
+  --accent: #7d1a1a;
+  --accent-foreground: #fae6b8;
+  --border: color-mix(in srgb, #e67321 45%, transparent);
+  --ring: #e67321;
+  --sidebar: #090505;
+  --sidebar-foreground: #fae6b8;
+  --sidebar-border: color-mix(in srgb, #e67321 40%, transparent);
+  /* keep existing Horatio typefaces from :root */
+}
+
+/* Doto button face — dot-matrix, a touch heavier for presence */
+.font-doto {
+  font-family: "Doto", ui-monospace, monospace;
+  font-weight: 600;
+  font-variation-settings: "wght" 600;
+  letter-spacing: 0.04em;
+}
+
+/* Fluid dither wash — recolored per theme so the background follows the theme.
+   Base art is AURORA (teal/pink); each theme hue-shifts it to harmonize. */
+[data-fluid-bg] {
+  opacity: 0.4;
+  filter: none;
+}
+
+/* Horatio — forest green ground: nudge teal toward green */
+html[data-theme='horatio'] [data-fluid-bg] {
+  opacity: 0.42;
+  filter: hue-rotate(-38deg) saturate(0.9);
+}
+
+/* Terminal — phosphor green: strong green, brighter */
+html[data-theme='terminal'] [data-fluid-bg] {
+  opacity: 0.35;
+  filter: hue-rotate(-55deg) saturate(1.3) brightness(1.05);
+}
+
+/* Archive — warm paper (light): soft amber, gentle so text stays readable */
+html[data-theme='archive'] [data-fluid-bg] {
+  opacity: 0.22;
+  filter: hue-rotate(150deg) saturate(0.7) brightness(1.08);
+}
+
+/* Slate — cool blue: shift teal toward azure */
+html[data-theme='slate'] [data-fluid-bg] {
+  opacity: 0.4;
+  filter: hue-rotate(40deg) saturate(1.1);
+}
+
+/* Aurora — native palette, no shift */
+html[data-theme='aurora'] [data-fluid-bg] {
+  opacity: 0.45;
+  filter: none;
+}
+
+/* Ember — coal + flame: teal/pink → reds / oranges */
+html[data-theme='ember'] [data-fluid-bg] {
+  opacity: 0.45;
+  filter: hue-rotate(155deg) saturate(1.25) brightness(0.92);
 }
 
 /* Light sheet — Preferences / modals */
@@ -128,16 +333,20 @@
   #root {
     height: 100%;
     margin: 0;
-    background-color: #041300;
+    background-color: var(--background);
   }
 
   body {
     @apply text-foreground antialiased;
-    background-color: #041300;
+    background-color: var(--background);
     font-family: var(--font-body);
     font-size: 14px;
     line-height: 1.45;
     color-scheme: dark;
+  }
+
+  html[data-theme='archive'] body {
+    color-scheme: light;
   }
 
   button {
