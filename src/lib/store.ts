@@ -34,6 +34,7 @@ import type {
   MemoryInfo,
   LinkInfo,
   SessionInfo,
+  UserEventRecord,
 } from './schema.js';
 
 export const RAW_FILE = 'raw.jsonl';
@@ -534,6 +535,23 @@ export function readDecisionsFile(file: string): DecisionEntry[] {
 
 export function readDecisions(blendId: string): DecisionEntry[] {
   return readDecisionsFile(decisionsPathForBlend(blendId));
+}
+
+// ---------------------------------------------------------------------------
+// User events — hand edits recorded by the Blender addon (horatio_user_tap).
+// One writer: the addon. Readers only here.
+// ---------------------------------------------------------------------------
+
+export const USER_EVENTS_FILE = 'user.jsonl';
+
+export function userEventsPathForBlend(blendId: string): string {
+  return path.join(blendDir(blendId), USER_EVENTS_FILE);
+}
+
+/** Newest-last user events for a blend; `limit` keeps the tail. */
+export function readUserEvents(blendId: string, limit?: number): UserEventRecord[] {
+  const all = readJsonl<UserEventRecord>(userEventsPathForBlend(blendId));
+  return limit && all.length > limit ? all.slice(-limit) : all;
 }
 
 const DECISION_LOG_HEADER = '## Decision log';

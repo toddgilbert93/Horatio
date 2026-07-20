@@ -84,12 +84,53 @@ type DigestRow = {
 
 /** Target digest + digests of sessions merged into it, events sorted by ts.
  *  Source artifact paths are rewritten absolute so thumbnails resolve. */
+/** One feed line for a hand edit recorded by the Blender addon. */
+function userEventSummary(ev: {
+  kind?: string;
+  op?: string;
+  name?: string;
+  objects?: Array<{ name: string; transform?: boolean; geometry?: boolean; loc?: number[] }>;
+  dropped?: number;
+}): string | null {
+  if (ev.kind === 'op' && ev.op) {
+    return `By hand: ${ev.name || ev.op} (${ev.op})`;
+  }
+  if (ev.kind === 'delta' && ev.objects?.length) {
+    const parts = ev.objects.map((o) => {
+      const what = [o.transform && 'moved', o.geometry && 'edited'].filter(Boolean).join('+') || 'changed';
+      const loc = o.loc ? ` → (${o.loc.join(', ')})` : '';
+      return `${o.name} ${what}${loc}`;
+    });
+    const more = ev.dropped ? ` (+${ev.dropped} more)` : '';
+    return `By hand: ${parts.join(', ')}${more}`;
+  }
+  return null; // meta records don't belong in the feed
+}
+
 function combinedDigest(sessionDir: string, sessionId: string): DigestRow[] {
   const own = store.readJsonl(store.digestPath(sessionDir)) as DigestRow[];
   const sources = mergeSourcesFor(sessionId);
-  if (sources.length === 0) return own;
 
   const rows: DigestRow[] = [...own];
+
+  // Hand edits from the linked blend's user.jsonl (Blender addon writer).
+  try {
+    const link = store.readLink(sessionDir);
+    if (link?.blendId && typeof store.readUserEvents === 'function') {
+      for (const ev of store.readUserEvents(link.blendId, 300)) {
+        const summary = userEventSummary(ev);
+        if (summary) {
+          rows.push({ kind: 'event', ts: ev.ts, type: 'user_action', summary } as DigestRow);
+        }
+      }
+    }
+  } catch {
+    /* user events are additive — never break the feed */
+  }
+
+  if (sources.length === 0) {
+    return rows.sort((a, b) => String(a.ts ?? '').localeCompare(String(b.ts ?? '')));
+  }
   for (const src of sources) {
     for (const row of store.readJsonl(store.digestPath(src.dir)) as DigestRow[]) {
       if (row.kind === 'event' && Array.isArray(row.artifacts)) {

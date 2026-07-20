@@ -33,6 +33,7 @@ import {
   readJsonl,
   readLink,
   readSessionInfo,
+  readUserEvents,
   storeState,
   type SessionRef,
 } from './lib/store.js';
@@ -331,6 +332,29 @@ function formatSessionRecall(target: ResolvedSession): string {
       if (budgets) parts.push('', `### Budgets & constraints`, orNone(budgets));
       if (naming) parts.push('', `### Naming conventions`, orNone(naming));
       if (knownFails) parts.push('', `### Known failure modes`, orNone(knownFails));
+    }
+
+    // Hand edits (Blender addon) — verbatim, no causal claims: these say what
+    // the human touched, never why. Agents must re-check the live scene.
+    const userEvents = readUserEvents(target.blend.id, 15).filter((e) => e.kind !== 'meta');
+    if (userEvents.length > 0) {
+      parts.push('', `## Recent manual edits in Blender (${target.blend.name})`);
+      parts.push(
+        userEvents
+          .map((e) => {
+            if (e.kind === 'op') return `- ${e.ts} — ${e.name || e.op} (${e.op})`;
+            const objs = (e.objects ?? [])
+              .map((o) => {
+                const what =
+                  [o.transform && 'moved', o.geometry && 'edited'].filter(Boolean).join('+') ||
+                  'changed';
+                return `${o.name} ${what}${o.loc ? ` → (${o.loc.join(', ')})` : ''}`;
+              })
+              .join(', ');
+            return `- ${e.ts} — ${objs}${e.dropped ? ` (+${e.dropped} more)` : ''}`;
+          })
+          .join('\n')
+      );
     }
   } else {
     const sessionDecisions = readDecisionsFile(decisionsPathForSession(target.session.dir));

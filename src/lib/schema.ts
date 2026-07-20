@@ -102,6 +102,29 @@ export interface DecisionEntry {
 }
 
 // ---------------------------------------------------------------------------
+// User events (blends/<id>/user.jsonl — written ONLY by the Blender addon
+// horatio_user_tap.py; hand edits attach to the blend, not a session)
+// ---------------------------------------------------------------------------
+
+export interface UserEventRecord {
+  ts: string;
+  src: 'user';
+  /** 'op' = operator history entry · 'delta' = debounced depsgraph change ·
+   *  'meta' = addon lifecycle */
+  kind: 'op' | 'delta' | 'meta';
+  /** kind 'op': operator idname, e.g. "transform.translate" */
+  op?: string;
+  /** kind 'op': human-readable operator label, e.g. "Move" */
+  name?: string;
+  props?: Record<string, unknown>;
+  /** kind 'delta': touched objects with transform/geometry flags */
+  objects?: Array<{ name: string; transform?: boolean; geometry?: boolean; loc?: number[] }>;
+  dropped?: number;
+  event?: string;
+  blend?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Per-session metadata — three files, one writer class each (design §3).
 // Atomic tmp+rename writes; readers merge the three.
 // ---------------------------------------------------------------------------
