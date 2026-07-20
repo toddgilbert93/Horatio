@@ -10,6 +10,8 @@ export type BustViewerProps = {
   /** Start/stop Y rotation — wire to an app event later */
   rotating?: boolean
   speed?: number
+  /** Set false to disable the brief, low-amplitude signal glitch */
+  glitch?: boolean
   materialId?: BustMaterialId
   /** Override model URL if the host app serves the GLB elsewhere */
   modelUrl?: string
@@ -29,6 +31,7 @@ export type BustViewerProps = {
 export function BustViewer({
   rotating = true,
   speed = 0.35,
+  glitch = true,
   materialId = 'bone',
   modelUrl = defaultModelUrl,
   className,
@@ -77,6 +80,7 @@ export function BustViewer({
               url={modelUrl}
               rotating={rotating}
               speed={speed}
+              glitch={glitch}
               materialId={materialId}
             />
           </Bounds>

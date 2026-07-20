@@ -77,7 +77,7 @@ export default function PreferencesApp() {
   }
 
   return (
-    <div className="sheet-light h-full bg-background text-foreground">
+    <div className="sheet-light h-full bg-background font-body text-foreground">
       <ControlPlane
         home={home}
         runtime={runtime}

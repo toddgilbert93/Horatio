@@ -220,7 +220,11 @@ export default function App() {
         <div className="absolute top-1/2 left-2 flex size-[180px] -translate-y-1/2 items-center justify-center overflow-hidden">
           <BustErrorBoundary fallback={<BustFallback />}>
             <Suspense fallback={<BustFallback />}>
-              <BustViewer rotating materialId="bone" style={{ maxWidth: 180, maxHeight: 180 }} />
+              <BustViewer
+                rotating
+                materialId="bone"
+                style={{ maxWidth: 180, maxHeight: 180 }}
+              />
             </Suspense>
           </BustErrorBoundary>
         </div>

@@ -45,6 +45,8 @@
   --font-display: "Jacquard 12", serif;
   --font-body: "Montaga", serif;
   --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  /* Hard offset shadow on secondary buttons — warm grey, not ink */
+  --hard-shadow: #8a8275;
 
   --radius: 0.25rem;
 
@@ -123,6 +125,8 @@ html[data-theme='archive'] {
   --sidebar-border: #d8ccb1;
   --font-display: "JetBrains Mono", ui-monospace, Menlo, monospace;
   --font-body: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --hard-shadow: #8a8275;
   color-scheme: light;
 }
 
@@ -272,7 +276,7 @@ html[data-theme='ember'] [data-fluid-tint] {
   backdrop-filter: hue-rotate(155deg) saturate(1.25) brightness(0.92);
 }
 
-/* Light sheet — Preferences / modals */
+/* Light sheet — Preferences / modals (JetBrains + Doto, matching Archive) */
 .sheet-light {
   --background: var(--color-lightest);
   --foreground: var(--color-dark);
@@ -295,7 +299,18 @@ html[data-theme='ember'] [data-fluid-tint] {
   --sidebar: color-mix(in srgb, var(--color-light-accent) 35%, white);
   --sidebar-foreground: var(--color-dark);
   --sidebar-border: var(--color-light-accent);
+  --font-display: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --font-body: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --hard-shadow: #8a8275;
   color-scheme: light;
+}
+
+.sheet-light button {
+  font-family: "Doto", ui-monospace, monospace;
+  font-weight: 600;
+  font-variation-settings: "wght" 600;
+  letter-spacing: 0.04em;
 }
 
 @theme inline {
